@@ -128,5 +128,35 @@ class ServiceTests(unittest.TestCase):
             with self.assertRaises(ValueError):self.service.command('dynamic',self.p.id)
         self.assertEqual(self.pool.provider_path.read_bytes(),before)
 
+    def test_dynamic_saved_to_selected_location_with_absolute_provider_reference(self):
+        import time
+        import json
+        rows=[{'ip':ip,'accepted':True,'validated_at':time.time(),'samples':[100]*6,'score':90} for ip in ['104.16.1.1','104.16.1.2']]
+        self.service.usable_results=lambda p:rows
+        events=[];self.service.emit=lambda *args:events.append(args)
+        # The existing pool is inactive in the current Clash profile.
+        self.api.snapshot=lambda p:{'cf':{},'provider':{}}
+        destination=Path(self.tmp.name)/'导入 Clash 的配置.yaml'
+        with patch('cfai.service.NodePool',return_value=self.pool),patch('cfai.service.API.discover',return_value=self.api):
+            self.service.command('dynamic',self.p.id,str(destination))
+        config=json.loads(destination.read_text(encoding='utf-8'))
+        self.assertEqual(Path(config['proxy-providers'][self.p.provider]['path']),self.pool.provider_path.resolve())
+        self.assertEqual(events[-1],('generated',str(destination)))
+        self.assertEqual(self.api.selected,[])
+
+    def test_dynamic_destination_failure_leaves_existing_pool_unchanged(self):
+        import time
+        rows=[{'ip':ip,'accepted':True,'validated_at':time.time(),'samples':[100]*6,'score':90} for ip in ['104.16.1.1','104.16.1.2']]
+        self.service.usable_results=lambda p:rows
+        self.api.snapshot=lambda p:{'cf':{},'provider':{}}
+        before=self.pool.provider_path.read_bytes()
+        with patch('cfai.service.NodePool',return_value=self.pool),patch('cfai.service.API.discover',return_value=self.api):
+            with self.assertRaises(ValueError):
+                self.service.command('dynamic',self.p.id,str(self.pool.provider_path))
+            with patch('cfai.service.write_yaml',side_effect=PermissionError('fixture')):
+                with self.assertRaises(PermissionError):
+                    self.service.command('dynamic',self.p.id,str(Path(self.tmp.name)/'not-writable.yaml'))
+        self.assertEqual(self.pool.provider_path.read_bytes(),before)
+
 
 if __name__=='__main__': unittest.main()

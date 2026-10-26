@@ -142,12 +142,15 @@ class Service:
             self.notify('notice', f'Clash 控制连接正常；' + ('此配置已接入' if state != 'other_profile' else '尚未启用本工具生成的动态配置'))
         elif action == 'dynamic':
             p = self.profile(args[0])
+            requested = Path(args[1]).resolve() if len(args) > 1 else None
             if self.scanning:
                 raise ValueError('请等待当前优选完成，再生成动态配置')
             rows = select_results(self.usable_results(p), p.settings.target_pool, ttl=p.settings.export_ttl)
             if len(rows) < 2:
                 raise ValueError('动态配置至少需要两条通过真实验证的节点')
             pool = NodePool(self.store.folder(p.id), p)
+            if requested and requested == pool.provider_path.resolve():
+                raise ValueError('动态配置不能保存到节点池文件本身，请选择其他文件名')
             if pool.manifest.exists():
                 try:
                     snapshot = API.discover(p).snapshot(p)
@@ -162,9 +165,12 @@ class Service:
                 staged = Path(d) / 'nodes.yaml'
                 atomic_json(staged, {'proxies': nodes})
                 check_config(dynamic_config(p, staged))
+            config = dynamic_config(p, pool.provider_path)
+            # Save the selected artifact atomically before replacing an inactive pool.
+            # A destination write failure therefore leaves the previous node pool untouched.
+            destination = requested or self.store.folder(p.id) / 'dynamic.yaml'
+            write_yaml(destination, config)
             pool.initialize(nodes)
-            destination = self.store.folder(p.id) / 'dynamic.yaml'
-            write_yaml(destination, dynamic_config(p, pool.provider_path))
             self.notify('generated', str(destination))
         elif action == 'export':
             instance, destination, provider_only, strategy, selected, count = args

@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import time
 
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize, QUrl
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize, QUrl, QStandardPaths
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGridLayout, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
@@ -792,7 +792,29 @@ class Window(QMainWindow):
         self.command('scan',self.download_check.isChecked())
 
     def generate(self):
-        self.command('dynamic')
+        p=self.current()
+        if not p: return self.message('先添加服务器')
+        if self.scan_busy: return self.message('请等待当前优选完成，再生成动态配置')
+        folder=QStandardPaths.writableLocation(QStandardPaths.DownloadLocation) or str(Path.home())
+        name=''.join('_' if c in '<>:"/\\|?*' else c for c in p.name).strip(' .') or 'CF-AI'
+        destination,_=QFileDialog.getSaveFileName(self,'保存动态配置',str(Path(folder)/f'{name}-动态配置.yaml'),'YAML (*.yaml *.yml)')
+        if destination:
+            if Path(destination).suffix.lower() not in ('.yaml','.yml'):
+                destination+='.yaml'
+            self.command('dynamic',destination)
+
+    def generated(self, path):
+        self.status.setText('动态配置已生成：'+str(path))
+        dialog=QMessageBox(self)
+        dialog.setWindowTitle('动态配置已生成')
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setText('在 Clash Verge 的订阅 / 配置页面导入并启用此文件，再选择本实例的 CF 组。')
+        dialog.setInformativeText(str(path)+'\n\n动态管理需要本工具持续运行。文件引用本机节点池，请保留本工具的数据目录。')
+        dialog.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        copy_button=dialog.addButton('复制文件路径',QMessageBox.ActionRole)
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(str(path)))
+        dialog.addButton('完成',QMessageBox.AcceptRole)
+        dialog.exec()
 
     def refresh_results(self):
         p=self.current()
@@ -870,8 +892,7 @@ class Window(QMainWindow):
         elif kind=='error': self.message(value,True)
         elif kind=='notice': self.message(value)
         elif kind=='generated':
-            self.message('动态配置已生成。\n\n在 Clash Verge 的订阅/配置页面导入并启用：\n'+value+'\n\n再选择本实例的 CF 组，并打开“动态管理”。\n本工具不会替你切换现用配置。')
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(value).parent)))
+            self.generated(value)
         elif kind=='stopped' and self.quitting: QApplication.instance().quit()
 
     def show_state(self,state):
