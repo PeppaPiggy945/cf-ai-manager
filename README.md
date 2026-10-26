@@ -1,0 +1,69 @@
+# 澄流 · CF AI Manager
+
+面向 AI 对话与编程的 Cloudflare 入口优选工具。Windows 10/11 x64；管理自己已搭建的 WS+TLS 隧道，不提供代理服务或部署 VPS。
+
+> 0.1.0 首版。源码公开，便携程序可本地构建。默认没有节点、账号或代理服务。
+
+![浅色界面（演示数据）](validation/screenshots/overview-light.png)
+
+[深色界面](validation/screenshots/overview-dark.png) · [优选结果](validation/screenshots/results-light.png)
+
+## 使用便携版
+
+完整解压 `CFAIManager-0.1.0-windows-x64.zip`，双击 `CFAIManager.exe`。保留旁边的 `_internal` 目录，无需安装 Python。首次启动是空配置，不含任何现成节点。
+
+1. 添加服务器，填写 CF 域名、协议、端口、UUID/密码和 WS 路径。SNI/Host 留空跟随域名。
+2. 到“优选结果”点击“开始优选”。使用独立内核验证真实隧道，默认含有限流量的下载测试。
+3. **只想导出**：点击“导出静态配置”，选择完整 Mihomo 配置或仅节点文件。文件内嵌凭据，不依赖本工具运行。
+4. **需要动态管理**：点击“生成动态配置”，在 Clash Verge Rev 中手动导入、启用生成的 `dynamic.yaml`，选择该实例 CF 组，再打开“动态管理”。工具不会替用户切换现用 profile。
+5. 默认仅故障切换；可开启“综合健康度自动优化”。主动优化受连续领先、优势门槛、冷却时间和业务活动保护约束。
+
+配置页面中的 VPS IP 是可选源站信息。Reality 等直连参数不能从 IP 自动推导；可另外导入直连单节点模板。首版表单支持 VLESS、VMess、Trojan 的 WS+TLS。
+
+## 策略与参数
+
+- 默认当前节点每 15 秒探测，备用每 60 秒；两个 HTTPS 地址复核后，连续失败两轮才视为故障。
+- 故障备用需连续成功三轮。控制 API 异常不等于节点故障；未知状态保留线路。
+- 默认成功率/响应/波动/带宽权重为 60/20/15/5；带宽到 2 Mbps 后封顶。没有可比较的下载证据时，整组统一去掉带宽项。
+- 开启追优后，默认同一候选领先至少 10 分、连续三轮新观测、至少间隔 30 分钟。故障切换豁免主动优化冷却。
+- 用户手动改变受管 CF 选择后进入“手动保持”，点击“恢复自动管理”解除。
+- 所有参数在设置中可调整，支持 AI 稳定和多模态/文件预设。下载测试是网络测量，不会发送模型请求或读取浏览器账号。
+
+## 测速、流量和网络
+
+先 TCP 初筛，再进行三轮、每轮两个 HTTPS 204 地址的真实隧道验证。5/6 成功且最后一轮全成功才准入。下载候选默认最多六条，每条 1 MB × 三轮；每条预热 128 KB，交错测试，默认单批下载响应体预算 30 MB。失败已读字节也计入预算；响应体达到单请求上限即停止，不依赖远端遵守 Range。
+
+预算是下载响应体字节，不是网卡总流量：TCP/TLS/HTTP 头、控制请求、网段与绕行验证也有少量开销。测速会占用同一宽带，默认不开启后台带宽复测。响应、下载和流式诊断不能证明某个 AI 账号、地区或出口 IP 获准使用服务。
+
+物理接口绑定用于避免 TUN 回灌。物理出口无法确认时停止优选，不退回现用代理测速。接口变化后旧成绩不能直接生成/导出。Windows 需有已连接的真实 IPv4 网卡和默认网关。
+
+## 数据和退出
+
+默认数据目录：`%LOCALAPPDATA%\CFAIManager`。节点凭据受当前用户目录权限保护，仍以本机配置形式保存；备份/静态导出包含凭据。不要将这些文件当诊断日志公开。
+
+动态 provider 位于 Clash Verge 的 `providers/cf-ai-manager/<实例ID>/nodes.yaml`。动态配置依赖此本机文件；静态配置不依赖。旧 Nova/Angeles 管理器不被自动停止，也不自动覆盖它们的数据。可在“服务器 → 导入现有配置”读取旧 manager 的 settings.json，再核对参数。
+
+关闭窗口默认进入托盘；从托盘选择“退出”停止探测、清理自己的验证内核，保留 Clash 当前线路。开机启动默认关闭；开启后在当前用户 Run 项记录本应用，不创建管理员计划任务。
+
+## 开发和验证
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+.venv\Scripts\python.exe prepare_resources.py
+$env:PYTHONPATH = (Get-Location).Path
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+.venv\Scripts\python.exe app.py --self-test
+.venv\Scripts\python.exe app.py --render-demo validation/screenshots --theme light
+.venv\Scripts\python.exe build.py
+```
+
+`--self-test` 和 `--render-demo` 使用独立临时数据目录，不启动生产监控、不请求外网。截图明确使用演示数据。
+
+源码仓库不存放 Mihomo EXE、构建输出、真实节点配置或运行记录。`prepare_resources.py` 从官方仓库下载固定版本的内核与对应源码，核对固定 SHA-256 后才写入资源目录。已有内核也须通过校验。此脚本仅准备构建资源，不安装程序或改动 Clash。
+
+`resources/core.json` 固定内核版本、来源及 SHA-256。构建前校验，运行独立内核前也校验；修改或更换内核时可同时更新该普通 JSON 清单并重新验证，未使用不可替换或加密锁定机制。PySide6 使用可替换的动态 Qt 库。第三方授权与对应源码位置见 `THIRD_PARTY_NOTICES.md`。
+
+## 首版验证边界
+
+这是 0.1.0 首版。离线策略、事务、下载预算和 GUI 烟测有自动验证；实机验证使用独立测试内核，不切换线上 Clash。尚未在全新 Windows 虚拟机、重启电脑、自启和各种网卡驱动组合上完成覆盖。暂不支持 IPv6 优选、WARP、任意协议转换或自动部署服务端。未作代码签名。

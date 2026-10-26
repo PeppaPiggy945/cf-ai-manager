@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+resources/mihomo.exe
+resources/mihomo-v1.19.32-source.tar.gz
+
+# Local runtime data and acceptance outputs never belong in the public tree.
+.env
+.env.*
+*.log
+*.lock
+*.tmp
+profiles*.json
+results.json
+observations.json
+pool.json
+pool-transaction.json
+preferences.json
+settings.json
+node_template.json
+instances/
+validation/*
+!validation/screenshots/
