@@ -98,6 +98,7 @@ def main():
         args.render_demo.mkdir(parents=True,exist_ok=True)
         window.show()
         window.states[p.id]={'id':p.id,'state':'cf','current':'CF-104.16.1.73','healthy':7,
+            'last_probe_at':time.time()-2,'last_scan_at':time.time()-3600,'next_scan_at':time.time()+23*3600,
             'stats':{'CF-104.16.1.73':{'median':182,'first_request':1032,'score':94.2}},'message':'演示数据 · 健康时保持线路，仅故障切换'}
         window.selection_changed()
         window.spark.values=[220,215,204,240,196,203,189,200,186,182,195,180,184,182]

@@ -65,12 +65,63 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.session.history.samples,{})
         self.assertEqual(self.api.selected,[])
 
-    def test_manual_selection_enters_hold_before_probe(self):
+    def test_manual_selection_keeps_monitoring_and_reports_metrics_without_switching(self):
         self.session.expected=self.api.names[1]
+        events=[];self.service.emit=lambda *args:events.append(args)
         with patch('cfai.service.API.discover',return_value=self.api),patch('cfai.service.NodePool',return_value=self.pool):
             self.service.tick(self.p,self.session)
         self.assertTrue(self.session.hold)
-        self.assertEqual(self.session.history.samples,{})
+        self.assertTrue(self.session.history.samples)
+        self.assertEqual(self.api.selected,[])
+        state=next(v for kind,v in events if kind=='state')
+        self.assertEqual(state['state'],'hold')
+        self.assertEqual(state['stats'][self.api.current]['median'],200)
+        self.assertEqual(state['stats'][self.api.current]['first_request'],1000)
+        self.assertGreater(state['last_probe_at'],0)
+        self.assertIn('next_scan_at',state)
+
+    def test_hold_blocks_failure_switch_and_pool_publication_but_allows_discovery(self):
+        import time
+        now=time.time();current,target=self.api.names
+        self.p.managed=True;self.p.optimize=True;self.session.hold=True
+        self.service.sessions[self.p.id]=self.session
+        for at in [now-30,now-20,now-10]:
+            self.session.history.record(current,None,at)
+            self.session.history.record(target,100,at,600)
+        self.api.values[current]=None
+        scans=[];self.service.start_scan=lambda *args,**kw:scans.append(kw)
+        before=self.pool.provider_path.read_bytes()
+        with patch('cfai.service.API.discover',return_value=self.api),patch('cfai.service.NodePool',return_value=self.pool):
+            self.service.tick(self.p,self.session)
+            self.service.publish_discovery(self.p,[{'ip':'104.16.1.3','accepted':True}])
+        self.assertEqual(self.api.selected,[])
+        self.assertEqual(self.pool.provider_path.read_bytes(),before)
+        self.assertEqual(len(scans),1)
+        self.assertTrue(scans[0]['automatic'])
+
+    def test_setting_change_does_not_reuse_an_unrelated_expected_selection(self):
+        from cfai.config import atomic_json
+        atomic_json(self.store.folder(self.p.id)/'observations.json',{'context':self.session.key,'expected':self.api.names[1],'hold':False})
+        self.p.settings.poll_seconds=20
+        session=Session(self.p,self.store,['network'])
+        self.assertIsNone(session.expected)
+        with patch('cfai.service.API.discover',return_value=self.api),patch('cfai.service.NodePool',return_value=self.pool):
+            self.service.tick(self.p,session)
+        self.assertFalse(session.hold)
+
+    def test_scan_schedule_reports_daily_due_time_without_forcing_a_fresh_scan(self):
+        import time
+        from cfai.config import atomic_json
+        now=time.time();last_scan=now-5*3600
+        atomic_json(self.store.folder(self.p.id)/'schedule.json',{'last_success':last_scan,'next_allowed':last_scan+900})
+        events=[];self.service.emit=lambda *args:events.append(args)
+        scans=[];self.service.start_scan=lambda *args,**kw:scans.append(kw)
+        with patch('cfai.service.API.discover',return_value=self.api),patch('cfai.service.NodePool',return_value=self.pool):
+            self.service.tick(self.p,self.session)
+        state=next(v for kind,v in events if kind=='state')
+        self.assertEqual(state['last_scan_at'],last_scan)
+        self.assertEqual(state['next_scan_at'],last_scan+self.p.settings.daily_seconds)
+        self.assertEqual(scans,[])
 
     def test_warm_request_failure_does_not_mark_working_node_down(self):
         self.api.measure=lambda name,*args:{'latency':None,'first_request':900}

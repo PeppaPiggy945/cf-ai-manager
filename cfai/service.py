@@ -29,12 +29,13 @@ class Session:
     def __init__(self, p, store, network):
         self.key = context_key(p, network)
         saved = read_json(store.folder(p.id) / 'observations.json', {})
-        self.history = History.restore(saved.get('history', {})) if saved.get('context') == self.key else History()
+        same_context = saved.get('context') == self.key
+        self.history = History.restore(saved.get('history', {})) if same_context else History()
         self.policy = Policy()
         self.policy.last_optimization = saved.get('last_optimization', -1e20) if saved.get('context') == self.key else -1e20
         self.activity = Activity()
         self.hold = saved.get('hold', False)
-        self.expected = saved.get('expected')
+        self.expected = saved.get('expected') if same_context else None
         self.last_tick = 0
         self.last_backup = 0
         self.state = 'waiting'
@@ -326,10 +327,6 @@ class Service:
         names = [n['name'] for n in nodes]
         if current not in names:
             raise ControllerError('节点池尚未对齐')
-        if session.hold:
-            self.notify('state', {'id': p.id, 'state': 'hold', 'current': current, 'message': '检测到手动选择，点击“恢复自动管理”解除保持'})
-            self.persist(p, session)
-            return
         network = DirectNetwork.discover()
         if self.network is not None and tuple(network.identity) != tuple(self.network):
             self.network_checked = 0
@@ -344,7 +341,7 @@ class Service:
         # Failure decisions use recent backups first and do not wait for a full dead pool.
         failed = session.history.stats(current, p.settings, time.time())['failed']
         decision = (session.policy.decide(current, session.history, names, p.settings, time.time(), False, False, False)
-                    if failed >= p.settings.failure_rounds else None)
+                    if not session.hold and failed >= p.settings.failure_rounds else None)
         if not decision and time.time() - session.last_backup >= p.settings.backup_seconds:
             others = [n for n in names if n != current]
             with ThreadPoolExecutor(max_workers=3) as executor:
@@ -357,7 +354,7 @@ class Service:
                     session.history.record(name, value['latency'], at, value['first_request'])
             session.last_backup = time.time()
         busy = False
-        if p.optimize and p.settings.protect_activity:
+        if p.optimize and p.settings.protect_activity and not session.hold:
             try:
                 busy = session.activity.busy(api.connections(), p, time.time(), p.settings.idle_seconds)
             except ControllerError:
@@ -390,14 +387,22 @@ class Service:
                     session.history.record(current, recovered['latency'], time.time(), recovered['first_request'])
         stats = scores(session.history, names, p.settings, time.time())
         healthy = sum(r['fresh'] and r['streak'] >= p.settings.recovery_rounds for n, r in stats.items() if n != session.current)
-        self.notify('state', {'id': p.id, 'state': 'cf', 'current': session.current, 'stats': stats,
-                             'healthy': healthy, 'last_switch': session.last_switch, 'busy': busy, 'message': '综合优化已开启' if p.optimize else '健康时保持线路，仅故障切换'})
-        self.persist(p, session)
         schedule = read_json(self.store.folder(p.id) / 'schedule.json', {})
         warmed = all(r['samples'] >= p.settings.recovery_rounds for n, r in stats.items() if n != session.current)
         now = time.time()
+        replenish = warmed and healthy < 3
+        daily_due = schedule.get('last_success', 0) + p.settings.daily_seconds
+        next_scan = max(schedule.get('next_allowed', 0), now if replenish else max(now, daily_due))
+        self.notify('state', {'id': p.id, 'state': 'hold' if session.hold else 'cf', 'current': session.current, 'stats': stats,
+                             'healthy': healthy, 'backups_ready': warmed, 'last_switch': session.last_switch, 'busy': busy,
+                             'last_probe_at': stats.get(session.current, {}).get('last_at', 0),
+                             'last_scan_at': schedule.get('last_success', 0), 'next_scan_at': next_scan,
+                             'scan_reason': '健康备用不足' if replenish else '周期发现', 'scanning': self.scanning,
+                             'message': '手动保持：继续监测与发现，不自动切换；点击“恢复自动管理”解除保持' if session.hold else
+                                        '综合优化已开启' if p.optimize else '健康时保持线路，仅故障切换'})
+        self.persist(p, session)
         if (not self.scanning and not self.stop_event.is_set() and now >= schedule.get('next_allowed', 0)
-                and (now - schedule.get('last_success', 0) >= p.settings.daily_seconds or (warmed and healthy < 3))):
+                and (now - schedule.get('last_success', 0) >= p.settings.daily_seconds or replenish)):
             self.start_scan(p, p.settings.background_bandwidth, automatic=True, expected=session.current)
 
     def persist(self, p, session):

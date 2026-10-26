@@ -549,6 +549,9 @@ class Window(QMainWindow):
             body.addWidget(self.metrics[key])
             metrics.addWidget(frame)
         layout.addLayout(metrics)
+        self.monitor_status = label('健康监测：等待接入动态配置。完整优选记录与实时健康探测分别显示。', 'muted')
+        self.monitor_status.setWordWrap(True)
+        layout.addWidget(self.monitor_status)
         frame, body = card()
         row = QHBoxLayout()
         row.addWidget(label('线路管理', 'accent'))
@@ -700,6 +703,7 @@ class Window(QMainWindow):
         self.optimize.setEnabled(bool(p))
         for widget in [self.managed,self.optimize]: widget.blockSignals(False)
         self.spark.values=[]
+        self.last_spark_sample=None
         if p:
             s=p.settings
             self.settings_summary.setText(f'权重 · 成功率 {s.weight_success:g} / 连接 {s.weight_latency:g} / 首次请求 {s.weight_first_request:g} / 波动 {s.weight_jitter:g} / 带宽 {s.weight_bandwidth:g}\n下载预算 {s.budget_bytes/1e6:g} MB    ·    目标池 {s.target_pool} 条    ·    优化领先 {s.advantage_points:g} 分 / 连续 {s.leading_rounds} 轮    ·    间隔 {s.cooldown_seconds//60} 分钟')
@@ -899,14 +903,30 @@ class Window(QMainWindow):
         p=self.current()
         if not p: return
         current=state.get('current')
-        self.hero_title.setText(('线路保持中' if state['state']=='hold' else '连接专注，保持流畅' if state['state']=='cf' else p.name))
+        active=state['state'] in ('cf','hold')
+        self.hero_title.setText(('手动保持 · 持续监测' if state['state']=='hold' else '连接专注，保持流畅' if state['state']=='cf' else p.name))
         self.hero_subtitle.setText((current+'    ·    ' if current else '')+state.get('message',''))
         row=state.get('stats',{}).get(current,{})
-        self.metrics['latency'].setText(f"{row['median']:.0f} ms" if row.get('median') else '—')
-        self.metrics['first_request'].setText(f"{row['first_request']:.0f} ms" if row.get('first_request') else '—')
-        self.metrics['healthy'].setText(str(state.get('healthy','—')))
-        self.metrics['score'].setText(f"{row['score']:.1f}" if row.get('score') is not None else '—')
-        if row.get('median'):
+        fresh=row.get('fresh',True)
+        pending='待探测' if active else '未监测'
+        self.metrics['latency'].setText(f"{row['median']:.0f} ms" if fresh and row.get('median') else pending)
+        self.metrics['first_request'].setText(f"{row['first_request']:.0f} ms" if fresh and row.get('first_request') else pending)
+        self.metrics['healthy'].setText(str(state.get('healthy',0)) if active and state.get('backups_ready',True) else '收集中' if active else '未监测')
+        self.metrics['score'].setText(f"{row['score']:.1f}" if fresh and row.get('score') is not None else '收集中' if active and row.get('samples') and fresh else pending)
+        def timestamp(value):
+            return time.strftime('%m-%d %H:%M:%S',time.localtime(value)) if value else '暂无记录'
+        if active:
+            next_scan=state.get('next_scan_at',0)
+            due='已到期，等待启动' if next_scan and next_scan<=time.time() else timestamp(next_scan)
+            scan=('正在优选' if state.get('scanning') else due+' · '+state.get('scan_reason','周期发现'))
+            self.monitor_status.setText('当前节点最近探测：'+timestamp(state.get('last_probe_at'))+f'    ·    探测周期 {p.settings.poll_seconds} 秒\n'
+                +'上次完整优选：'+timestamp(state.get('last_scan_at'))+'    ·    下次自动优选：'+scan
+                +('    ·    保持期间只更新候选结果，不替换节点池' if state['state']=='hold' else ''))
+        else:
+            self.monitor_status.setText('健康监测：'+state.get('message','等待接入动态配置'))
+        point=(p.id,current,row.get('last_at'))
+        if fresh and row.get('median') and point!=getattr(self,'last_spark_sample',None):
+            self.last_spark_sample=point
             self.spark.values.append(row['median'])
             self.spark.values=self.spark.values[-40:]
             self.spark.update()
