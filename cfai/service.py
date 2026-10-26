@@ -17,12 +17,12 @@ from .config import Profile, atomic_json, read_json
 from .export import dynamic_config, select_results, static_config, write_yaml
 from .health import History, Policy, scores
 from .network import DirectNetwork
-from .scanner import Scanner, check_config
+from .scanner import Scanner, check_config, isolated_core
 from .speed import Cancelled
 
 
 def context_key(p, network):
-    return hashlib.sha256(json.dumps([p.fingerprint(), asdict(p.settings), network], sort_keys=True).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([2, p.fingerprint(), asdict(p.settings), network], sort_keys=True).encode()).hexdigest()
 
 
 class Session:
@@ -190,7 +190,7 @@ class Service:
                 for row in rows:
                     bw = row.get('download', {}).get('mbps')
                     if row.get('accepted') and bw is not None:
-                        session.history.bandwidth[f"CF-{row['ip']}"] = {'mbps': bw, 'at': time.time()}
+                        session.history.bandwidth[f"CF-{row['ip']}"] = {'mbps': bw, 'at': row.get('download', {}).get('at', row['validated_at'])}
             if automatic:
                 self.publish_discovery(p, rows)
             self.notify('results', instance)
@@ -286,12 +286,13 @@ class Service:
     def probe(self, api, p, name, cancelled=lambda: False):
         if self.stop_event.is_set() or cancelled():
             raise ControllerError('探测已取消')
-        delay = api.delay(name, p.settings.probe_urls[0], p.settings.timeout_ms, p.provider)
-        if delay is None:
+        stop = lambda: self.stop_event.is_set() or cancelled()
+        measurement = api.measure(name, p.settings.probe_urls[0], p.settings.timeout_ms, stop)
+        if measurement['first_request'] is None:
             if self.stop_event.wait(p.settings.confirmation_seconds) or cancelled():
                 raise ControllerError('探测已取消')
-            delay = api.delay(name, p.settings.probe_urls[1], p.settings.timeout_ms, p.provider)
-        return delay
+            measurement = api.measure(name, p.settings.probe_urls[1], p.settings.timeout_ms, stop)
+        return measurement
 
     def tick(self, p, session):
         api = API.discover(p)
@@ -315,16 +316,25 @@ class Service:
             session.policy.reset()
         session.expected = current
         session.current = current
-        names = [n['name'] for n in pool.nodes()]
+        nodes = pool.nodes()
+        names = [n['name'] for n in nodes]
         if current not in names:
             raise ControllerError('节点池尚未对齐')
         if session.hold:
             self.notify('state', {'id': p.id, 'state': 'hold', 'current': current, 'message': '检测到手动选择，点击“恢复自动管理”解除保持'})
             self.persist(p, session)
             return
-        delay = self.probe(api, p, current)
+        network = DirectNetwork.discover()
+        if self.network is not None and tuple(network.identity) != tuple(self.network):
+            self.network_checked = 0
+            raise ControllerError('物理出口已变化，等待重新收集样本')
+        with isolated_core(nodes, network, self.stop_event.is_set, time.monotonic() + 600) as (probe_api, _):
+            self.tick_probes(p, session, api, probe_api, names, current, network.identity)
+
+    def tick_probes(self, p, session, api, probe_api, names, current, network):
+        delay = self.probe(probe_api, p, current)
         completed_at = time.time()
-        session.history.record(current, delay, completed_at)
+        session.history.record(current, delay['latency'], completed_at, delay['first_request'])
         # Failure decisions use recent backups first and do not wait for a full dead pool.
         failed = session.history.stats(current, p.settings, time.time())['failed']
         decision = (session.policy.decide(current, session.history, names, p.settings, time.time(), False, False, False)
@@ -332,13 +342,13 @@ class Service:
         if not decision and time.time() - session.last_backup >= p.settings.backup_seconds:
             others = [n for n in names if n != current]
             with ThreadPoolExecutor(max_workers=3) as executor:
-                futures = {executor.submit(self.probe, api, p, name): name for name in others}
+                futures = {executor.submit(self.probe, probe_api, p, name): name for name in others}
                 completed = []
                 for future in as_completed(futures):
                     completed.append((futures[future], future.result(), time.time()))
                 # All responses must be trustworthy; controller errors leave the entire batch unscored.
                 for name, value, at in completed:
-                    session.history.record(name, value, at)
+                    session.history.record(name, value['latency'], at, value['first_request'])
             session.last_backup = time.time()
         busy = False
         if p.optimize and p.settings.protect_activity:
@@ -349,14 +359,15 @@ class Service:
         decision = decision or session.policy.decide(current, session.history, names, p.settings, time.time(), p.optimize, busy, session.hold)
         if decision:
             target = decision['target']
-            target_delay = self.probe(api, p, target)
-            session.history.record(target, target_delay, time.time())
-            if target_delay is not None:
-                recovered = self.probe(api, p, current)
+            target_delay = self.probe(probe_api, p, target)
+            session.history.record(target, target_delay['latency'], time.time(), target_delay['first_request'])
+            if target_delay['first_request'] is not None:
+                recovered = self.probe(probe_api, p, current)
                 # A failure switch is abandoned if the original node has recovered.
-                if decision['reason'] != 'failure' or recovered is None:
+                if decision['reason'] != 'failure' or recovered['first_request'] is None:
                     final = api.snapshot(p)
-                    if guard(final, p) == ('cf', current) and not self.stop_event.is_set():
+                    same_network = tuple(DirectNetwork.discover().identity) == tuple(network)
+                    if guard(final, p) == ('cf', current) and not self.stop_event.is_set() and same_network:
                         if decision['reason'] == 'optimization' and p.settings.protect_activity:
                             busy = session.activity.busy(api.connections(), p, time.time(), p.settings.idle_seconds)
                         refreshed = scores(session.history, names, p.settings, time.time())
@@ -370,7 +381,7 @@ class Service:
                                 session.policy.switched(time.time(), decision['reason'])
                                 self.logger.info('switch %s %s', p.id, decision['reason'])
                 else:
-                    session.history.record(current, recovered, time.time())
+                    session.history.record(current, recovered['latency'], time.time(), recovered['first_request'])
         stats = scores(session.history, names, p.settings, time.time())
         healthy = sum(r['fresh'] and r['streak'] >= p.settings.recovery_rounds for n, r in stats.items() if n != session.current)
         self.notify('state', {'id': p.id, 'state': 'cf', 'current': session.current, 'stats': stats,

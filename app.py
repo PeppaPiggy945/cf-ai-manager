@@ -23,6 +23,7 @@ def main():
     from cfai.scanner import check_config, core_path
     from cfai.export import static_config
     from cfai.gui import Window
+    from cfai import __version__
     application=QApplication(sys.argv[:1])
     application.setApplicationName('CFAIManager')
     application.setOrganizationName('CFAIManager')
@@ -52,7 +53,8 @@ def main():
         store.save_profiles([p])
         rows=[]
         for i,(ip,delay,score,bw) in enumerate([('104.16.1.73',182,94.2,7.1),('104.24.130.121',196,92.8,5.2),('188.114.98.121',218,91.6,4.8),('172.67.71.130',225,90.3,3.7)]):
-            rows.append({'ip':ip,'accepted':True,'samples':[delay]*6,'validated_at':time.time(),
+            rows.append({'ip':ip,'accepted':True,'samples':[delay+850]*6,
+                         'latency_samples':[delay]*6,'first_request_samples':[delay+850]*6,'validated_at':time.time(),
                          'median':delay,'score':score,'download':{'mbps':bw,'cv':.08},'network':['demo']})
         store.save_results(p,rows,['demo'])
         atomic_json(store.root/'preferences.json',{'theme':args.theme,'startup':False})
@@ -83,7 +85,7 @@ def main():
         window.show()
         application.processEvents()
         assert window.result_table.rowCount()==4
-        report={'ok':True,'version':'0.1.0','core_verified':True,'ui_pages':window.tabs.count(),
+        report={'ok':True,'version':__version__,'core_verified':True,'ui_pages':window.tabs.count(),
                 'result_rows':window.result_table.rowCount(),'settings_roundtrip':True,'isolated_config_check':True}
         if args.data_dir:
             atomic_json(args.data_dir/'self-test.json',report)
@@ -96,7 +98,7 @@ def main():
         args.render_demo.mkdir(parents=True,exist_ok=True)
         window.show()
         window.states[p.id]={'id':p.id,'state':'cf','current':'CF-104.16.1.73','healthy':7,
-            'stats':{'CF-104.16.1.73':{'median':182,'score':94.2}},'message':'演示数据 · 健康时保持线路，仅故障切换'}
+            'stats':{'CF-104.16.1.73':{'median':182,'first_request':1032,'score':94.2}},'message':'演示数据 · 健康时保持线路，仅故障切换'}
         window.selection_changed()
         window.spark.values=[220,215,204,240,196,203,189,200,186,182,195,180,184,182]
         application.processEvents()

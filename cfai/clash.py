@@ -94,6 +94,20 @@ class API:
         delay = value.get('delay') if isinstance(value, dict) else None
         return float(delay) if type(delay) in (int, float) and math.isfinite(delay) and 0 < delay <= timeout_ms else None
 
+    def measure(self, name, url, timeout_ms, cancelled=lambda: False):
+        from .latency import measure_pair
+        ports = getattr(self, 'probe_ports', {})
+        if name not in ports:
+            raise ControllerError('独立双指标探测端口不可用')
+        self.request('GET', '/version', timeout=1)
+        try:
+            result = measure_pair(ports[name], url, timeout_ms, cancelled)
+        except ConnectionRefusedError:
+            raise ControllerError('独立测试代理不可用') from None
+        if result['first_request'] is None:
+            self.request('GET', '/version', timeout=1)
+        return result
+
     def select(self, group, name):
         self.request('PUT', '/proxies/' + quote(group, safe=''), {'name': name})
 

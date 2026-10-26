@@ -20,7 +20,7 @@ import time
 
 from .clash import API, ControllerError
 from .config import atomic_json, read_json
-from .health import History, scores
+from .health import rank_results
 from .network import DirectNetwork
 from .speed import Budget, Cancelled, download, round_orders, summarize
 from .process import ChildJob
@@ -73,6 +73,14 @@ def isolated_core(nodes, network, cancelled, deadline):
         while proxy_port == controller_port:
             proxy_port = free_port()
         secret = secrets.token_hex(24)
+        used_ports = {controller_port, proxy_port}
+        probe_ports = {}
+        for node in nodes:
+            port = free_port()
+            while port in used_ports:
+                port = free_port()
+            used_ports.add(port)
+            probe_ports[node['name']] = port
         test_nodes = copy.deepcopy(nodes)
         if network:
             for node in test_nodes:
@@ -82,6 +90,11 @@ def isolated_core(nodes, network, cancelled, deadline):
                   'log-level': 'silent', 'mode': 'rule', 'profile': {'store-selected': False},
                   'proxies': test_nodes, 'proxy-groups': [{'name': 'TEST', 'type': 'select', 'proxies': [n['name'] for n in nodes]}],
                   'rules': ['MATCH,TEST'], 'dns': {'enable': False}}
+        # Dedicated per-node inbounds allow concurrent paired HTTPS requests without
+        # racing the shared TEST selector or touching the user's active Clash core.
+        config['listeners'] = [{'name': f'probe-{i}', 'type': 'mixed', 'listen': '127.0.0.1',
+                                'port': probe_ports[n['name']], 'proxy': n['name'], 'udp': False}
+                               for i, n in enumerate(nodes)]
         if network:
             config['interface-name'] = network.interface['name']
         path = folder / 'config.json'
@@ -93,6 +106,7 @@ def isolated_core(nodes, network, cancelled, deadline):
                 process = subprocess.Popen([str(core_path()), '-d', d, '-f', str(path)], stdout=output, stderr=output, creationflags=FLAGS)
                 job.attach(process)
                 api = API(f'http://127.0.0.1:{controller_port}', secret)
+                api.probe_ports = probe_ports
                 for _ in range(80):
                     if cancelled() or time.monotonic() > deadline or process.poll() is not None:
                         raise Cancelled()
@@ -254,7 +268,7 @@ class Scanner:
         if not chosen:
             raise ValueError('本轮没有入口通过 TCP 初筛，原节点池保持不变')
         self.event('scan', f'真实隧道验证 · {len(chosen)} 个候选 / 3 轮')
-        rows = [{'ip': r['ip'], 'samples': [], 'sample_times': []} for r in chosen]
+        rows = [{'ip': r['ip'], 'samples': [], 'latency_samples': [], 'first_request_samples': [], 'sample_times': []} for r in chosen]
         nodes = [p.node(r['ip']) for r in rows]
         with isolated_core(nodes, network, stopped, deadline) as (test_api, proxy_port):
             def probe(row):
@@ -262,13 +276,15 @@ class Scanner:
                 for url in s.probe_urls[:2]:
                     if stopped():
                         raise Cancelled()
-                    pair.append(test_api.delay(f"CF-{row['ip']}", url, s.timeout_ms))
+                    pair.append(test_api.measure(f"CF-{row['ip']}", url, s.timeout_ms, stopped))
                 return row, pair, time.time()
             for round_index in range(3):
                 with ThreadPoolExecutor(max_workers=s.validation_workers) as pool:
                     for future in as_completed([pool.submit(probe, r) for r in rows]):
                         row, pair, completed = future.result()
-                        row['samples'].extend(pair)
+                        row['first_request_samples'].extend(v['first_request'] for v in pair)
+                        row['latency_samples'].extend(v['latency'] for v in pair)
+                        row['samples'].extend(v['first_request'] for v in pair)
                         row['sample_times'].extend([completed] * 2)
                 if round_index < 2:
                     until = time.monotonic() + s.validation_interval
@@ -276,13 +292,10 @@ class Scanner:
                         if stopped():
                             raise Cancelled()
                         time.sleep(.1)
-            h = History()
             for row in rows:
                 values = row['samples']
                 row.update(accepted=sum(x is not None for x in values) >= 5 and all(x is not None for x in values[-2:]),
                            validated_at=time.time(), network=list(network.identity), source=source)
-                for at, delay in zip(row['sample_times'], values):
-                    h.record(row['ip'], delay, at)
             accepted = [r for r in rows if r['accepted']]
             budget = Budget(s.budget_bytes)
             if with_download and accepted:
@@ -312,18 +325,13 @@ class Scanner:
                             failed.add(ip)
                 for ip, values in runs.items():
                     summary = summarize(values, s.maximum_cv)
+                    summary['at'] = time.time()
                     by_ip[ip]['download'] = summary
-                    if summary['mbps'] is not None:
-                        h.bandwidth[ip] = {'mbps': summary['mbps'], 'at': time.time()}
             # Batch ranking is an export snapshot, not production freshness. A long download batch
             # must not erase valid earlier latency samples; never seed live recovery streaks from it.
-            snapshot_settings = copy.deepcopy(s)
-            snapshot_settings.fresh_seconds = max(s.fresh_seconds, 1200)
-            snapshot_settings.window_seconds = max(s.window_seconds, 1200)
-            ranked = scores(h, [r['ip'] for r in accepted], snapshot_settings, time.time())
             for row in rows:
-                row.update({k: v for k, v in ranked.get(row['ip'], {}).items() if k not in ('samples',)})
                 row['download_bytes_total'] = budget.used
+            rows = rank_results(rows, s)
         if stopped():
             raise Cancelled()
         if DirectNetwork.discover().identity != network.identity:

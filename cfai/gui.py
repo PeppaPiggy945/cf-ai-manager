@@ -75,7 +75,7 @@ class Sparkline(QWidget):
         painter.drawLine(0, h - 12, w, h - 12)
         if len(self.values) < 2:
             painter.setPen(QColor('#81938c'))
-            painter.drawText(self.rect(), Qt.AlignCenter, '开始管理后显示响应趋势')
+            painter.drawText(self.rect(), Qt.AlignCenter, '开始管理后显示连接延迟趋势')
             return
         high = max(max(self.values), 50)
         path = QPainterPath()
@@ -245,8 +245,9 @@ PARAM_LABELS = {
  'target_pool':'目标池大小', 'max_pool':'安全池上限', 'export_count':'默认导出节点数', 'export_ttl':'导出验证有效期 / 秒',
  'daily_seconds':'周期发现间隔 / 秒', 'replenish_seconds':'补充扫描最小间隔 / 秒', 'background_bandwidth':'后台发现时测下载（额外流量）',
  'latency_share':'低延迟候选比例 / 0–1', 'history_share':'历史优秀候选比例 / 0–1',
- 'latency_reference':'响应评分参考值 / 毫秒', 'jitter_reference':'波动评分参考值 / 毫秒',
- 'weight_success':'成功率权重', 'weight_latency':'响应速度权重', 'weight_jitter':'响应波动权重', 'weight_bandwidth':'带宽权重',
+ 'latency_reference':'连接延迟参考值 / 毫秒', 'first_request_reference':'首次请求参考值 / 毫秒', 'jitter_reference':'连接延迟波动参考值 / 毫秒',
+ 'weight_success':'成功率权重', 'weight_latency':'连接延迟权重', 'weight_first_request':'首次请求耗时权重',
+ 'weight_jitter':'连接延迟波动权重', 'weight_bandwidth':'带宽权重',
  'probe_urls':'HTTPS 探测地址 / 每行一个（至少两个）', 'download_url':'HTTPS 下载测速地址',
  'stream_url':'自有流式诊断 HTTPS 地址（可选）', 'stream_seconds':'流式诊断最长时长 / 秒', 'stream_idle_seconds':'流式诊断空闲超时 / 秒'}
 
@@ -260,7 +261,7 @@ class SettingsDialog(QDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
         root.addWidget(label('为你的工作方式调校', 'title'))
-        root.addWidget(label('参数按服务器保存。改变参数会重新收集健康观测；不会提高现有测速预算。', 'muted'))
+        root.addWidget(label('参数按服务器保存。评分权重即时重排已有双指标结果；动态健康观测会重新收集。', 'muted'))
         bar = QHBoxLayout()
         bar.addWidget(button('恢复 AI 稳定预设', lambda: self.preset('ai')))
         bar.addWidget(button('多模态 / 文件预设', lambda: self.preset('multimodal')))
@@ -271,13 +272,21 @@ class SettingsDialog(QDialog):
         self.controls = {}
         groups = [ ('切换与健康', list(asdict(settings))[:15]),
             ('扫描与节点池', ['sample_count','tcp_workers','validation_candidates','validation_workers','validation_interval','target_pool','max_pool','export_count','export_ttl','daily_seconds','replenish_seconds','latency_share','history_share']),
-            ('下载与评分', ['download_candidates','download_bytes','download_rounds','warmup_bytes','budget_bytes','download_timeout','bandwidth_floor','maximum_cv','bandwidth_ttl','background_bandwidth','latency_reference','jitter_reference','weight_success','weight_latency','weight_jitter','weight_bandwidth']),
+            ('下载测速', ['download_candidates','download_bytes','download_rounds','warmup_bytes','budget_bytes','download_timeout','maximum_cv','bandwidth_ttl','background_bandwidth']),
+            ('健康评分', ['weight_success','weight_latency','weight_first_request','weight_jitter','weight_bandwidth','latency_reference','first_request_reference','jitter_reference','bandwidth_floor']),
             ('探测与诊断', ['probe_urls','download_url','stream_url','stream_seconds','stream_idle_seconds'])]
         for title, keys in groups:
             container = QWidget()
             form = QFormLayout(container)
             form.setSpacing(15)
             form.setContentsMargins(12, 20, 18, 20)
+            if title == '健康评分':
+                note = label('权重为相对比例，设为 0 即不计入。缺少某项测量时，所有参与比较的节点统一移除该项，再按剩余权重评分。\n连接延迟：同一 HTTPS 连接上的第二次请求。首次请求：包含代理建连、TLS 与 WS 握手。均非 AI 首字生成时间。', 'muted')
+                note.setWordWrap(True)
+                form.addRow(note)
+                self.weight_summary = label('', 'accent')
+                self.weight_summary.setWordWrap(True)
+                form.addRow(self.weight_summary)
             for key in keys:
                 value = getattr(settings, key)
                 if type(value) is bool:
@@ -305,6 +314,9 @@ class SettingsDialog(QDialog):
             scroll.setWidgetResizable(True)
             scroll.setWidget(container)
             tabs.addTab(scroll, title)
+        for key in ('weight_success', 'weight_latency', 'weight_first_request', 'weight_jitter', 'weight_bandwidth'):
+            self.controls[key].valueChanged.connect(self.update_weights)
+        self.update_weights()
         self.error = label('', 'error')
         root.addWidget(self.error)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
@@ -313,7 +325,7 @@ class SettingsDialog(QDialog):
         root.addWidget(buttons)
 
     def preset(self, name):
-        changed = '带宽达标线 10 Mbps；权重 50 / 17 / 13 / 20' if name == 'multimodal' else '恢复 AI 稳定默认参数'
+        changed = '带宽达标线 10 Mbps；成功率 / 连接 / 首次请求 / 波动 / 带宽权重 50 / 12 / 5 / 13 / 20' if name == 'multimodal' else '恢复 AI 稳定默认参数'
         if QMessageBox.question(self, '应用预设', changed + '\n其余参数恢复默认；当前流量预算保持。是否继续？') != QMessageBox.Yes:
             return
         budget = self.controls['budget_bytes'].value()
@@ -325,6 +337,12 @@ class SettingsDialog(QDialog):
             elif isinstance(c, (QSpinBox, QDoubleSpinBox)): c.setValue(value)
             elif isinstance(c, QPlainTextEdit): c.setPlainText('\n'.join(value))
             else: c.setText(value)
+
+    def update_weights(self):
+        keys = ['weight_success', 'weight_latency', 'weight_first_request', 'weight_jitter', 'weight_bandwidth']
+        values = [self.controls[k].value() for k in keys]
+        total = sum(values)
+        self.weight_summary.setText('完整指标占比 · ' + ' / '.join(f'{name} {100*v/total:.1f}%' if total else f'{name} 0%' for name, v in zip(['成功率','连接','首次','波动','带宽'], values)))
 
     def save(self):
         values = {}
@@ -344,7 +362,7 @@ class ExportDialog(QDialog):
     def __init__(self, parent, profile, rows):
         super().__init__(parent)
         self.setWindowTitle('导出静态优选配置')
-        self.resize(680, 570)
+        self.resize(800, 570)
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 24)
         root.addWidget(label('把好线路带走', 'title'))
@@ -362,8 +380,8 @@ class ExportDialog(QDialog):
         form.addRow('内核策略', self.strategy)
         root.addLayout(form)
         root.addWidget(label('下列节点仅显示本轮真实验证通过的项。下载数据不足不等于断线；过期验证不能导出。', 'muted'))
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(['选择 / 入口 IP', '响应', '带宽证据', '验证时间'])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(['选择 / 入口 IP', '连接延迟', '首次请求耗时', '带宽证据', '验证时间'])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setSelectionMode(QTableWidget.NoSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -382,7 +400,7 @@ class ExportDialog(QDialog):
             self.table.setItem(i,0,item)
             self.checks.append(item)
             bw = row.get('download',{}).get('mbps')
-            for col, value in enumerate([f"{row.get('median', 0):.0f} ms" if row.get('median') else '—', f'{bw:.2f} Mbps' if bw is not None else '未测 / 不稳定', time.strftime('%m-%d %H:%M',time.localtime(row.get('validated_at',0))) + ('' if fresh else ' 已过期')],1):
+            for col, value in enumerate([f"{row['median']:.0f} ms" if row.get('median') else '—', f"{row['first_request']:.0f} ms" if row.get('first_request') else '—', f'{bw:.2f} Mbps' if bw is not None else '未测 / 不稳定', time.strftime('%m-%d %H:%M',time.localtime(row.get('validated_at',0))) + ('' if fresh else ' 已过期')],1):
                 self.table.setItem(i,col,QTableWidgetItem(value))
         root.addWidget(self.table)
         root.addWidget(label('fallback / url-test 是 Mihomo 自身策略，不包含本工具的综合健康度算法。', 'muted'))
@@ -394,6 +412,7 @@ class ExportDialog(QDialog):
 
 def theme_styles(dark=False):
     bg, surface, text, muted, border, field = ('#131e20','#1c292b','#e5eeeb','#9aacaa','#344448','#243537') if dark else ('#f4f5ef','#ffffff','#213631','#75827c','#e1e6dc','#f9faf5')
+    selection_bg, selection_text = ('#2c514b', '#edf8f2') if dark else ('#dcefe6', '#173e34')
     return f'''
     QWidget {{ font-family: "Noto Sans CJK SC", "Microsoft YaHei UI", "Segoe UI"; font-size: 13px; color: {text}; }}
     QMainWindow, QDialog {{ background: {bg}; }}
@@ -420,8 +439,9 @@ def theme_styles(dark=False):
     QTabWidget::pane {{ border: none; background: transparent; }}
     QTabBar::tab {{ background: transparent; color: {muted}; padding: 15px 24px; margin-right: 8px; border-bottom: 3px solid transparent; font-size: 14px; }}
     QTabBar::tab:selected {{ color: #349b81; border-bottom: 3px solid #349b81; font-weight: 650; }}
-    QTableWidget {{ background: {surface}; border: 1px solid {border}; border-radius: 10px; gridline-color: {border}; selection-background-color: {field}; outline: none; }}
+    QTableWidget {{ background: {surface}; border: 1px solid {border}; border-radius: 10px; gridline-color: {border}; selection-background-color: {selection_bg}; selection-color: {selection_text}; outline: none; }}
     QTableWidget::item {{ padding: 12px 8px; }}
+    QTableWidget::item:selected {{ background: {selection_bg}; color: {selection_text}; }}
     QHeaderView::section {{ background: {field}; color: {muted}; border: none; padding: 12px; font-size: 12px; }}
     QScrollArea {{ border: none; background: transparent; }}
     QScrollArea > QWidget > QWidget {{ background: transparent; }}
@@ -522,7 +542,7 @@ class Window(QMainWindow):
         layout.addWidget(hero)
         metrics = QHBoxLayout()
         self.metrics = {}
-        for key,title in [('latency','当前响应'),('healthy','健康备用'),('score','综合健康度')]:
+        for key,title in [('latency','连接延迟'),('first_request','首次请求耗时'),('healthy','健康备用'),('score','综合健康度')]:
             frame, body = card()
             body.addWidget(label(title,'muted'))
             self.metrics[key] = label('—','metric')
@@ -591,8 +611,10 @@ class Window(QMainWindow):
         self.progress.setTextVisible(False)
         self.progress.hide()
         layout.addWidget(self.progress)
-        self.result_table = QTableWidget(0,6)
-        self.result_table.setHorizontalHeaderLabels(['CF 入口 IP','真实验证','响应','健康分','下载能力','验证时间'])
+        self.result_table = QTableWidget(0,7)
+        self.result_table.setHorizontalHeaderLabels(['CF 入口 IP','真实验证','连接延迟','首次请求耗时','健康分','下载能力','验证时间'])
+        self.result_table.horizontalHeaderItem(2).setToolTip('复用同一 HTTPS 连接的第二次 HEAD 请求耗时；六次测量取中位数')
+        self.result_table.horizontalHeaderItem(3).setToolTip('从本机发起代理连接到收到首次 HTTPS HEAD 响应，含代理、TLS、WS 握手；六次测量取中位数')
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.result_table.verticalHeader().hide()
         self.result_table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -680,7 +702,7 @@ class Window(QMainWindow):
         self.spark.values=[]
         if p:
             s=p.settings
-            self.settings_summary.setText(f'AI 健康权重 {s.weight_success:g} / {s.weight_latency:g} / {s.weight_jitter:g} / {s.weight_bandwidth:g}    ·    下载预算 {s.budget_bytes/1e6:g} MB\n目标池 {s.target_pool} 条    ·    主动优化领先 {s.advantage_points:g} 分 / 连续 {s.leading_rounds} 轮    ·    间隔 {s.cooldown_seconds//60} 分钟')
+            self.settings_summary.setText(f'权重 · 成功率 {s.weight_success:g} / 连接 {s.weight_latency:g} / 首次请求 {s.weight_first_request:g} / 波动 {s.weight_jitter:g} / 带宽 {s.weight_bandwidth:g}\n下载预算 {s.budget_bytes/1e6:g} MB    ·    目标池 {s.target_pool} 条    ·    优化领先 {s.advantage_points:g} 分 / 连续 {s.leading_rounds} 轮    ·    间隔 {s.cooldown_seconds//60} 分钟')
             self.show_state(self.states.get(p.id,{'state':'ready','message':'配置已保存。优选后生成动态配置，或直接导出静态节点。'}))
         else:
             self.hero_title.setText('从一条可靠的线路开始')
@@ -775,10 +797,13 @@ class Window(QMainWindow):
     def refresh_results(self):
         p=self.current()
         self.rows=self.store.results(p) if p else []
+        if any(r.get('legacy_measurement') for r in self.rows):
+            self.scan_status.setText('旧结果仅有首次请求耗时；连接延迟与健康分待重新优选后补齐。')
         self.result_table.setRowCount(len(self.rows))
         for i,row in enumerate(self.rows):
             bw=row.get('download',{}).get('mbps')
             values=[row['ip'],'通过' if row.get('accepted') else '未通过',f"{row['median']:.0f} ms" if row.get('median') else '—',
+                f"{row['first_request']:.0f} ms" if row.get('first_request') else '—',
                 f"{row['score']:.1f}" if row.get('score') is not None else '数据不足',f'{bw:.2f} Mbps' if bw is not None else '未测 / 不稳定',
                 time.strftime('%m-%d %H:%M',time.localtime(row.get('validated_at',0)))]
             for j,value in enumerate(values):
@@ -857,6 +882,7 @@ class Window(QMainWindow):
         self.hero_subtitle.setText((current+'    ·    ' if current else '')+state.get('message',''))
         row=state.get('stats',{}).get(current,{})
         self.metrics['latency'].setText(f"{row['median']:.0f} ms" if row.get('median') else '—')
+        self.metrics['first_request'].setText(f"{row['first_request']:.0f} ms" if row.get('first_request') else '—')
         self.metrics['healthy'].setText(str(state.get('healthy','—')))
         self.metrics['score'].setText(f"{row['score']:.1f}" if row.get('score') is not None else '—')
         if row.get('median'):

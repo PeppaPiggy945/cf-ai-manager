@@ -2,6 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 from cfai.config import Profile, Store
 from cfai.health import History
@@ -25,6 +27,9 @@ class FakeAPI:
         value=self.values[name]
         if isinstance(value,Exception): raise value
         return value
+    def measure(self,name,*args):
+        value=self.delay(name)
+        return {'latency':value,'first_request':value*5 if value is not None else None}
     def select(self,group,name):
         self.selected.append(name)
         self.current=name
@@ -45,6 +50,10 @@ class ServiceTests(unittest.TestCase):
         self.pool=NodePool(self.store.folder(self.p.id),self.p,Path(self.tmp.name)/'provider.json')
         self.pool.initialize([self.p.node('104.16.1.1'),self.p.node('104.16.1.2')])
         self.api=FakeAPI(self.p,[n['name'] for n in self.pool.nodes()])
+        network_patch=patch('cfai.service.DirectNetwork.discover',return_value=SimpleNamespace(identity=('network',)))
+        network_patch.start();self.addCleanup(network_patch.stop)
+        core_patch=patch('cfai.service.isolated_core',return_value=nullcontext((self.api,0)))
+        core_patch.start();self.addCleanup(core_patch.stop)
         self.session=Session(self.p,self.store,['network'])
         self.service.start_scan=lambda *a,**kw:None
 
@@ -62,6 +71,16 @@ class ServiceTests(unittest.TestCase):
             self.service.tick(self.p,self.session)
         self.assertTrue(self.session.hold)
         self.assertEqual(self.session.history.samples,{})
+
+    def test_warm_request_failure_does_not_mark_working_node_down(self):
+        self.api.measure=lambda name,*args:{'latency':None,'first_request':900}
+        with patch('cfai.service.API.discover',return_value=self.api),patch('cfai.service.NodePool',return_value=self.pool):
+            for _ in range(3): self.service.tick(self.p,self.session)
+        stats=self.session.history.stats(self.api.current,self.p.settings,__import__('time').time())
+        self.assertEqual(stats['failed'],0)
+        self.assertEqual(stats['first_request'],900)
+        self.assertIsNone(stats['median'])
+        self.assertEqual(self.api.selected,[])
 
     def test_failure_switch_only_after_two_failed_rounds(self):
         import time

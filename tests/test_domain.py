@@ -62,13 +62,15 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(store.recovery_note)
             self.assertEqual(len(list(Path(d).glob('profiles.corrupt-*.json'))),1)
 
-    def test_settings_change_invalidates_old_measurements(self):
+    def test_scoring_change_retains_results_but_probe_change_invalidates_them(self):
         with tempfile.TemporaryDirectory() as d:
             store=Store(Path(d))
             p=profile()
             store.save_results(p,[{'ip':'104.16.1.1'}],['fixture'])
             self.assertEqual(len(store.results(p)),1)
             p.settings.weight_latency=30
+            self.assertEqual(len(store.results(p)),1)
+            p.settings.timeout_ms=6000
             self.assertEqual(store.results(p),[])
 
 

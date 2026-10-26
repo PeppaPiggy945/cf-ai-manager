@@ -41,6 +41,10 @@ def public_ip(value):
     return str(address)
 
 
+SCORING_FIELDS = {'latency_reference', 'first_request_reference', 'jitter_reference', 'bandwidth_floor',
+                  'weight_success', 'weight_latency', 'weight_first_request', 'weight_jitter', 'weight_bandwidth'}
+
+
 @dataclass
 class Settings:
     poll_seconds: int = 15
@@ -80,9 +84,11 @@ class Settings:
     latency_share: float = 0.5
     history_share: float = 0.25
     latency_reference: float = 300
+    first_request_reference: float = 1500
     jitter_reference: float = 100
     weight_success: float = 60
-    weight_latency: float = 20
+    weight_latency: float = 15
+    weight_first_request: float = 5
     weight_jitter: float = 15
     weight_bandwidth: float = 5
     probe_urls: list = field(default_factory=lambda: ['https://www.gstatic.com/generate_204', 'https://cp.cloudflare.com/generate_204'])
@@ -113,7 +119,8 @@ class Settings:
             if type(getattr(self, key)) is not bool:
                 raise ValueError(f'{key} 必须是开关值')
         for key in ('advantage_points', 'bandwidth_floor', 'maximum_cv', 'latency_share', 'history_share',
-                    'latency_reference', 'jitter_reference', 'weight_success', 'weight_latency', 'weight_jitter', 'weight_bandwidth'):
+                    'latency_reference', 'first_request_reference', 'jitter_reference', 'weight_success', 'weight_latency',
+                    'weight_first_request', 'weight_jitter', 'weight_bandwidth'):
             value = getattr(self, key)
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
                 raise ValueError(f'{key} 必须是非负有限数字')
@@ -122,10 +129,10 @@ class Settings:
         if self.window_seconds < self.fresh_seconds or self.target_pool > self.max_pool:
             raise ValueError('统计窗口或节点池上下限不合理')
         if (self.latency_share + self.history_share > 1 or self.bandwidth_floor <= 0
-                or self.latency_reference <= 0 or self.jitter_reference <= 0 or not 0 < self.maximum_cv <= 2
+                or self.latency_reference <= 0 or self.first_request_reference <= 0 or self.jitter_reference <= 0 or not 0 < self.maximum_cv <= 2
                 or self.advantage_points > 100):
             raise ValueError('评分参考值、波动或候选比例不合理')
-        if self.weight_success + self.weight_latency + self.weight_jitter <= 0:
+        if self.weight_success + self.weight_latency + self.weight_first_request + self.weight_jitter <= 0:
             raise ValueError('连通性评分权重总和必须大于零')
         if self.budget_bytes < self.download_bytes + self.warmup_bytes:
             raise ValueError('流量预算不足以完成一次下载与预热')
@@ -148,7 +155,7 @@ class Settings:
         other = Settings()
         if name == 'multimodal':
             other.bandwidth_floor = 10
-            other.weight_success, other.weight_latency, other.weight_jitter, other.weight_bandwidth = 50, 17, 13, 20
+            other.weight_success, other.weight_latency, other.weight_first_request, other.weight_jitter, other.weight_bandwidth = 50, 12, 5, 13, 20
         elif name != 'ai':
             raise ValueError('未知预设')
         return other
@@ -236,7 +243,8 @@ class Profile:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def measurement_key(self):
-        return hashlib.sha256(json.dumps([self.fingerprint(), asdict(self.settings)], sort_keys=True).encode()).hexdigest()
+        settings = {k: v for k, v in asdict(self.settings).items() if k not in SCORING_FIELDS}
+        return hashlib.sha256(json.dumps([2, self.fingerprint(), settings], sort_keys=True).encode()).hexdigest()
 
     def to_dict(self):
         return asdict(self)
@@ -315,7 +323,25 @@ class Store:
 
     def results(self, p):
         document = read_json(self.folder(p.id) / 'results.json', {})
-        return document.get('rows', []) if document.get('fingerprint') == p.fingerprint() and document.get('measurement_key') == p.measurement_key() else []
+        if document.get('fingerprint') != p.fingerprint():
+            return []
+        if document.get('measurement_key') == p.measurement_key():
+            from .health import rank_results
+            return rank_results(document.get('rows', []), p.settings)
+        # Previous releases measured cold requests only. Keep the real cold values visible,
+        # but never reinterpret them as connection latency or retain their old score.
+        legacy = asdict(p.settings)
+        for key in ('first_request_reference', 'weight_first_request'):
+            legacy.pop(key)
+        legacy_key = hashlib.sha256(json.dumps([p.fingerprint(), legacy], sort_keys=True).encode()).hexdigest()
+        if document.get('measurement_key') == legacy_key:
+            rows = copy.deepcopy(document.get('rows', []))
+            for row in rows:
+                row.update(first_request=row.get('median'), first_request_samples=row.get('samples', []),
+                           latency_samples=[None] * len(row.get('samples', [])), median=None, jitter=None,
+                           score=None, legacy_measurement=True)
+            return rows
+        return []
 
     def save_results(self, p, rows, network):
         atomic_json(self.folder(p.id) / 'results.json', {'fingerprint': p.fingerprint(), 'measurement_key': p.measurement_key(), 'network': list(network), 'rows': rows})

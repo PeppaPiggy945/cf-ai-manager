@@ -14,6 +14,7 @@ ROOT=Path(__file__).resolve().parent
 def main():
     sys.path.insert(0,str(ROOT))
     from cfai.scanner import core_path
+    from cfai import __version__
     core_path()
     resources=ROOT/'resources'
     required=['MIHOMO-LICENSE.txt','fonts/OFL.txt','licenses/ClashCloudflareDynamic.txt','mihomo-v1.19.32-source.tar.gz']
@@ -54,7 +55,7 @@ def main():
                 raise RuntimeError('Runtime user data entered release')
             manifest[relative]=hashlib.sha256(path.read_bytes()).hexdigest()
     (package/'SHA256SUMS.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
-    archive=ROOT/'dist'/'CFAIManager-0.1.0-windows-x64.zip'
+    archive=ROOT/'dist'/f'CFAIManager-{__version__}-windows-x64.zip'
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
         for path in sorted(package.rglob('*')):
             if path.is_file():z.write(path,Path('CFAIManager')/path.relative_to(package))
