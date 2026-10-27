@@ -76,6 +76,19 @@ class GenerationUITests(unittest.TestCase):
         configure.assert_not_called()
         self.assertIn('Windows 已禁用',self.window.startup_status.text())
 
+    def test_export_routing_controls_roundtrip(self):
+        from cfai.gui import SettingsDialog
+        dialog = SettingsDialog(self.window, self.profile.settings)
+        self.addCleanup(dialog.close)
+        dialog.controls['reject_foreign_quic'].setChecked(False)
+        dialog.controls['extra_direct_domains'].setPlainText('game.example.com\ncdn.example.com')
+        dialog.controls['extra_direct_processes'].setPlainText('国服.exe')
+        dialog.save()
+        self.assertIsNotNone(dialog.result_settings)
+        self.assertFalse(dialog.result_settings.reject_foreign_quic)
+        self.assertEqual(dialog.result_settings.extra_direct_domains, ['game.example.com', 'cdn.example.com'])
+        self.assertEqual(dialog.result_settings.extra_direct_processes, ['国服.exe'])
+
 
 if __name__ == '__main__':
     unittest.main()

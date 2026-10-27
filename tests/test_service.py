@@ -209,5 +209,35 @@ class ServiceTests(unittest.TestCase):
                     self.service.command('dynamic',self.p.id,str(Path(self.tmp.name)/'not-writable.yaml'))
         self.assertEqual(self.pool.provider_path.read_bytes(),before)
 
+    def test_active_dynamic_export_reuses_pool_without_scan_or_reinitialization(self):
+        import json
+        self.service.usable_results=lambda p:self.fail('Active export must not rebuild the pool from scan results')
+        before=self.pool.provider_path.read_bytes()
+        manifest=self.pool.manifest.read_bytes()
+        destination=Path(self.tmp.name)/'updated-rules.yaml'
+        with patch('cfai.service.NodePool',return_value=self.pool),patch('cfai.service.API.discover',return_value=self.api), \
+             patch.object(self.pool,'initialize',side_effect=AssertionError('Existing pool reset')):
+            self.service.command('dynamic',self.p.id,str(destination))
+        config=json.loads(destination.read_text(encoding='utf-8'))
+        self.assertIn('RULE-SET,CFAI-CN,DIRECT',config['rules'])
+        self.assertEqual(before,self.pool.provider_path.read_bytes())
+        self.assertEqual(manifest,self.pool.manifest.read_bytes())
+        self.assertEqual(self.api.selected,[])
+
+    def test_active_export_rejects_drift_and_pending_transaction_without_writing(self):
+        destination=Path(self.tmp.name)/'updated-rules.yaml'
+        for condition in ['drift','transaction']:
+            with self.subTest(condition=condition):
+                if condition=='drift':
+                    self.api.names.append('CF-104.16.1.3')
+                else:
+                    self.api.names.pop()
+                    self.pool.journal.write_text('{}',encoding='utf-8')
+                before=self.pool.provider_path.read_bytes()
+                with patch('cfai.service.NodePool',return_value=self.pool),patch('cfai.service.API.discover',return_value=self.api):
+                    with self.assertRaises(ValueError):self.service.command('dynamic',self.p.id,str(destination))
+                self.assertFalse(destination.exists())
+                self.assertEqual(before,self.pool.provider_path.read_bytes())
+
 
 if __name__=='__main__': unittest.main()

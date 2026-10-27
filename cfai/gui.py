@@ -249,14 +249,17 @@ PARAM_LABELS = {
  'weight_success':'成功率权重', 'weight_latency':'连接延迟权重', 'weight_first_request':'首次请求耗时权重',
  'weight_jitter':'连接延迟波动权重', 'weight_bandwidth':'带宽权重',
  'probe_urls':'HTTPS 探测地址 / 每行一个（至少两个）', 'download_url':'HTTPS 下载测速地址',
- 'stream_url':'自有流式诊断 HTTPS 地址（可选）', 'stream_seconds':'流式诊断最长时长 / 秒', 'stream_idle_seconds':'流式诊断空闲超时 / 秒'}
+ 'stream_url':'自有流式诊断 HTTPS 地址（可选）', 'stream_seconds':'流式诊断最长时长 / 秒', 'stream_idle_seconds':'流式诊断空闲超时 / 秒',
+ 'direct_china':'国内网段与国内游戏域名直连', 'direct_stun':'游戏打洞 UDP 3478 直连',
+ 'reject_foreign_quic':'拦截剩余 UDP 443（浏览器回退 TCP）',
+ 'extra_direct_domains':'额外直连域名 / 每行一个', 'extra_direct_processes':'额外直连进程名 / 每行一个'}
 
 
 class SettingsDialog(QDialog):
     def __init__(self, parent, settings):
         super().__init__(parent)
         self.setWindowTitle('调整优选参数')
-        self.resize(730, 690)
+        self.resize(860, 740)
         self.result_settings = None
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
@@ -274,12 +277,17 @@ class SettingsDialog(QDialog):
             ('扫描与节点池', ['sample_count','tcp_workers','validation_candidates','validation_workers','validation_interval','target_pool','max_pool','export_count','export_ttl','daily_seconds','replenish_seconds','latency_share','history_share']),
             ('下载测速', ['download_candidates','download_bytes','download_rounds','warmup_bytes','budget_bytes','download_timeout','maximum_cv','bandwidth_ttl','background_bandwidth']),
             ('健康评分', ['weight_success','weight_latency','weight_first_request','weight_jitter','weight_bandwidth','latency_reference','first_request_reference','jitter_reference','bandwidth_floor']),
-            ('探测与诊断', ['probe_urls','download_url','stream_url','stream_seconds','stream_idle_seconds'])]
+            ('探测与诊断', ['probe_urls','download_url','stream_url','stream_seconds','stream_idle_seconds']),
+            ('导出分流', ['direct_china','direct_stun','reject_foreign_quic','extra_direct_domains','extra_direct_processes'])]
         for title, keys in groups:
             container = QWidget()
             form = QFormLayout(container)
             form.setSpacing(15)
             form.setContentsMargins(12, 20, 18, 20)
+            if title == '导出分流':
+                note = label('动态与完整静态配置共用这些规则。默认国内 IPv4 / IPv6、常见国内游戏域名和 UDP 3478 直连；AI 域名优先走 AI 组。\n额外域名填 example.com，自动包含子域；进程填 game.exe，命中时该进程的非 AI 流量全部直连。国内放行后才拦截其余 UDP 443。\n修改后需重新导出并在 Clash 中导入 / 重新加载；“仅节点文件”沿用接收配置的规则。', 'muted')
+                note.setWordWrap(True)
+                form.addRow(note)
             if title == '健康评分':
                 note = label('权重为相对比例，设为 0 即不计入。缺少某项测量时，所有参与比较的节点统一移除该项，再按剩余权重评分。\n连接延迟：同一 HTTPS 连接上的第二次请求。首次请求：包含代理建连、TLS 与 WS 握手。均非 AI 首字生成时间。', 'muted')
                 note.setWordWrap(True)

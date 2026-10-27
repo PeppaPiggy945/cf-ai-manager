@@ -138,7 +138,8 @@ class DualScoreTests(unittest.TestCase):
             store = Store(Path(d))
             p = Profile('test', 'node.example.org', '11111111-2222-4333-8444-555555555555')
             legacy = p.to_dict()['settings']
-            for key in ['first_request_reference', 'weight_first_request']: legacy.pop(key)
+            from cfai.config import ROUTING_FIELDS
+            for key in ['first_request_reference', 'weight_first_request', *ROUTING_FIELDS]: legacy.pop(key)
             key = hashlib.sha256(json.dumps([p.fingerprint(), legacy], sort_keys=True).encode()).hexdigest()
             atomic_json(store.folder(p.id) / 'results.json', {'fingerprint': p.fingerprint(), 'measurement_key': key,
                 'rows': [{'ip': '104.16.1.1', 'median': 1100, 'score': 82, 'samples': [1100]*6}]})

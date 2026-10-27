@@ -1,0 +1,20 @@
+{
+  "source": "https://github.com/gaoyifan/china-operator-ip",
+  "commit": "375060e2299aa6344a87f309568ac3d748baf0cc",
+  "snapshot_date": "2026-10-27",
+  "license": "MIT",
+  "files": {
+    "china.txt": {
+      "url": "https://raw.githubusercontent.com/gaoyifan/china-operator-ip/375060e2299aa6344a87f309568ac3d748baf0cc/china.txt",
+      "sha256": "cd9c414cb1c6d3818cf4434e12d3e32c95aaac57afd0b4faac44ee46cb5bb33f",
+      "count": 6525
+    },
+    "china6.txt": {
+      "url": "https://raw.githubusercontent.com/gaoyifan/china-operator-ip/375060e2299aa6344a87f309568ac3d748baf0cc/china6.txt",
+      "sha256": "a2f14c3d600dc7612638c51fd741d3d4cf4f115519436e05d4558d49e50664c9",
+      "count": 3489
+    }
+  },
+  "license_url": "https://raw.githubusercontent.com/gaoyifan/china-operator-ip/b2b8edc0ddd9cf2bc638ec77587301bbf84b8db9/LICENSE",
+  "license_sha256": "8f4d03a581484143945a9fac471c3b669d5aada68361fd1f25886c3ddbdd786a"
+}

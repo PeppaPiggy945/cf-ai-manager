@@ -13,7 +13,7 @@ import threading
 import time
 
 from .clash import API, Activity, ControllerError, NodePool, guard
-from .config import Profile, atomic_json, read_json
+from .config import Profile, ROUTING_FIELDS, atomic_json, read_json
 from .export import dynamic_config, select_results, static_config, write_yaml
 from .health import History, Policy, scores
 from .network import DirectNetwork
@@ -22,7 +22,8 @@ from .speed import Cancelled
 
 
 def context_key(p, network):
-    return hashlib.sha256(json.dumps([2, p.fingerprint(), asdict(p.settings), network], sort_keys=True).encode()).hexdigest()
+    settings = {k: v for k, v in asdict(p.settings).items() if k not in ROUTING_FIELDS}
+    return hashlib.sha256(json.dumps([2, p.fingerprint(), settings, network], sort_keys=True).encode()).hexdigest()
 
 
 class Session:
@@ -146,20 +147,31 @@ class Service:
             requested = Path(args[1]).resolve() if len(args) > 1 else None
             if self.scanning:
                 raise ValueError('请等待当前优选完成，再生成动态配置')
-            rows = select_results(self.usable_results(p), p.settings.target_pool, ttl=p.settings.export_ttl)
-            if len(rows) < 2:
-                raise ValueError('动态配置至少需要两条通过真实验证的节点')
             pool = NodePool(self.store.folder(p.id), p)
             if requested and requested == pool.provider_path.resolve():
                 raise ValueError('动态配置不能保存到节点池文件本身，请选择其他文件名')
+            reuse = False
             if pool.manifest.exists():
                 try:
                     snapshot = API.discover(p).snapshot(p)
                     if snapshot.get('cf', {}).get('type') == 'Selector' and snapshot.get('provider'):
-                        raise ValueError('此配置正在使用，请先在 Clash 切换到其他配置再重新生成')
+                        nodes = pool.validated(pool.nodes())
+                        names = {n['name'] for n in nodes}
+                        actual_file = read_json(pool.provider_path, {}).get('proxies')
+                        if (pool.journal.exists() or actual_file != nodes
+                                or set(snapshot['cf'].get('all', [])) != names
+                                or snapshot['cf'].get('now') not in names
+                                or snapshot['provider'].get('vehicleType') != 'File'
+                                or {n['name'] for n in snapshot['provider'].get('proxies', [])} != names):
+                            raise ValueError('现用节点池尚未同步，暂不能生成；请等待管理同步或切换到其他配置')
+                        reuse = True
                 except ControllerError:
                     raise ValueError('无法确认 Clash 当前配置，不能覆盖已有动态节点池；请恢复控制连接后重试，或新建独立实例') from None
-            nodes = [p.node(r['ip']) for r in rows]
+            if not reuse:
+                rows = select_results(self.usable_results(p), p.settings.target_pool, ttl=p.settings.export_ttl)
+                if len(rows) < 2:
+                    raise ValueError('动态配置至少需要两条通过真实验证的节点')
+                nodes = [p.node(r['ip']) for r in rows]
             # Validate with an isolated local provider path first; production provider is never a staging area.
             from tempfile import TemporaryDirectory
             with TemporaryDirectory(prefix='cfai-dynamic-check-') as d:
@@ -171,7 +183,8 @@ class Service:
             # A destination write failure therefore leaves the previous node pool untouched.
             destination = requested or self.store.folder(p.id) / 'dynamic.yaml'
             write_yaml(destination, config)
-            pool.initialize(nodes)
+            if not reuse:
+                pool.initialize(nodes)
             self.notify('generated', str(destination))
         elif action == 'export':
             instance, destination, provider_only, strategy, selected, count = args

@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 import time
 import yaml
+from .routing import routing_config
 
 
 def select_results(rows, count, now=None, ttl=86400, ips=None):
@@ -32,9 +33,7 @@ def static_config(profile, rows, provider_only=False, strategy='select'):
     if strategy != 'select':
         group.update(url=profile.settings.probe_urls[0], interval=300)
     return {'mixed-port': 7890, 'allow-lan': False, 'mode': 'rule', 'log-level': 'info',
-            'proxies': nodes, 'proxy-groups': [group], 'rules': ['IP-CIDR,127.0.0.0/8,DIRECT,no-resolve',
-            'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve', 'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve',
-            'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve', 'MATCH,AI']}
+            'proxies': nodes, 'proxy-groups': [group], **routing_config(profile.settings, 'AI')}
 
 
 def write_yaml(path, data):
@@ -56,4 +55,4 @@ def dynamic_config(profile, provider_path):
             'profile': {'store-selected': True}, 'proxies': nodes,
             'proxy-providers': {profile.provider: {'type': 'file', 'path': str(Path(provider_path).resolve()).replace('\\', '/'),
                 'health-check': {'enable': False}}},
-            'proxy-groups': [outer, group], 'rules': [f'MATCH,{profile.outer}']}
+            'proxy-groups': [outer, group], **routing_config(profile.settings, profile.outer)}

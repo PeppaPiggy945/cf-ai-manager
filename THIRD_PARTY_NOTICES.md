@@ -6,6 +6,10 @@ CF AI Manager source files in this directory: MIT License; see LICENSE.txt. The 
 
 The independent project ClashCloudflareDynamic v1.5.2 was studied for multi-round interleaving, request-wall-clock throughput, historical candidate allocation and download reporting. Its implementation is MIT licensed, copyright 2026 ClashCloudflareDynamic contributors: https://github.com/YanYunCY/ClashCloudflareDynamic . This application implements its own UI and independent-core pipeline. Its license is preserved under resources/licenses/ClashCloudflareDynamic.txt.
 
+## China routing snapshot
+
+Domestic IPv4 / IPv6 CIDRs are an unmodified snapshot of gaoyifan/china-operator-ip's ip-lists branch, commit 375060e2299aa6344a87f309568ac3d748baf0cc, retrieved 2026-10-27. MIT License, copyright (c) 2017 Yifan Gao. Source: https://github.com/gaoyifan/china-operator-ip . Full license, pinned source URLs and hashes accompany resources/routing/. Complete exported configurations include both inline CIDRs and the full MIT notice under cfai-routing-info. These are routing classifications, not a guarantee of physical server location. The list is updated with application releases; there is no background subscription dependency.
+
 ## Mihomo
 
 MetaCubeX/mihomo v1.19.32, GPL-3.0. Runs as a separate executable communicating over local REST/HTTP, not as a linked library. Upstream release and exact asset are recorded in resources/core.json.

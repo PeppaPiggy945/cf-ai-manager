@@ -15,7 +15,9 @@ def main():
     sys.path.insert(0,str(ROOT))
     from cfai.scanner import core_path
     from cfai import __version__
+    from cfai.routing import china_snapshot
     core_path()
+    china_snapshot()
     resources=ROOT/'resources'
     required=['MIHOMO-LICENSE.txt','fonts/OFL.txt','licenses/ClashCloudflareDynamic.txt','mihomo-v1.19.32-source.tar.gz']
     for name in required:

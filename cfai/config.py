@@ -43,6 +43,7 @@ def public_ip(value):
 
 SCORING_FIELDS = {'latency_reference', 'first_request_reference', 'jitter_reference', 'bandwidth_floor',
                   'weight_success', 'weight_latency', 'weight_first_request', 'weight_jitter', 'weight_bandwidth'}
+ROUTING_FIELDS = {'direct_china', 'direct_stun', 'reject_foreign_quic', 'extra_direct_domains', 'extra_direct_processes'}
 
 
 @dataclass
@@ -96,6 +97,11 @@ class Settings:
     stream_url: str = ''
     stream_seconds: int = 60
     stream_idle_seconds: int = 15
+    direct_china: bool = True
+    direct_stun: bool = True
+    reject_foreign_quic: bool = True
+    extra_direct_domains: list = field(default_factory=list)
+    extra_direct_processes: list = field(default_factory=list)
 
     def validate(self):
         from urllib.parse import urlsplit
@@ -115,7 +121,7 @@ class Settings:
             value = getattr(self, key)
             if type(value) is not int or not minimum <= value <= maximum:
                 raise ValueError(f'{key} 必须是 {minimum}–{maximum} 之间的整数')
-        for key in ('protect_activity', 'background_bandwidth'):
+        for key in ('protect_activity', 'background_bandwidth', 'direct_china', 'direct_stun', 'reject_foreign_quic'):
             if type(getattr(self, key)) is not bool:
                 raise ValueError(f'{key} 必须是开关值')
         for key in ('advantage_points', 'bandwidth_floor', 'maximum_cv', 'latency_share', 'history_share',
@@ -142,6 +148,15 @@ class Settings:
             parts = urlsplit(url)
             if parts.scheme != 'https' or not parts.hostname or parts.username or parts.password:
                 raise ValueError('探测地址必须是无内嵌凭据的 HTTPS URL')
+        for key in ('extra_direct_domains', 'extra_direct_processes'):
+            values = getattr(self, key)
+            if not isinstance(values, list) or len(values) > 200:
+                raise ValueError('额外直连规则每类最多 200 条')
+            for value in values:
+                if not isinstance(value, str) or not value.strip() or len(value) > 253 or any(c in value for c in ',\r\n'):
+                    raise ValueError('额外直连规则须逐行填写，不能含逗号或空行')
+                if key == 'extra_direct_domains' and not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?', value):
+                    raise ValueError('直连域名只填域名，不含协议、端口、路径或通配符')
         return self
 
     @classmethod
@@ -243,7 +258,7 @@ class Profile:
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
     def measurement_key(self):
-        settings = {k: v for k, v in asdict(self.settings).items() if k not in SCORING_FIELDS}
+        settings = {k: v for k, v in asdict(self.settings).items() if k not in SCORING_FIELDS | ROUTING_FIELDS}
         return hashlib.sha256(json.dumps([2, self.fingerprint(), settings], sort_keys=True).encode()).hexdigest()
 
     def to_dict(self):
@@ -331,7 +346,7 @@ class Store:
         # Previous releases measured cold requests only. Keep the real cold values visible,
         # but never reinterpret them as connection latency or retain their old score.
         legacy = asdict(p.settings)
-        for key in ('first_request_reference', 'weight_first_request'):
+        for key in ('first_request_reference', 'weight_first_request', *ROUTING_FIELDS):
             legacy.pop(key)
         legacy_key = hashlib.sha256(json.dumps([p.fingerprint(), legacy], sort_keys=True).encode()).hexdigest()
         if document.get('measurement_key') == legacy_key:
