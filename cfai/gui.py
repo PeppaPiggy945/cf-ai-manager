@@ -691,6 +691,12 @@ class Window(QMainWindow):
         if not p:
             self.message('先添加一台服务器')
         elif self.service:
+            if action in ('scan', 'stream'):
+                if self.scan_busy:
+                    return
+                # Claim the UI immediately, including time spent waiting for a health probe.
+                self.handle_event('scan_started', p.id)
+                self.scan_status.setText('任务已提交，正在等待后台释放探测资源…')
             self.service.submit(action,p.id,*args)
 
     def refresh_profiles(self, selected=None):
@@ -898,7 +904,14 @@ class Window(QMainWindow):
             self.scan_status.setText(value)
             self.status.setText(value)
         elif kind=='scan_done':
-            self.scan_status.setText(f"优选完成 · {sum(r.get('accepted',False) for r in value['rows'])} 条通过真实验证 · 下载 {value['bytes']/1e6:.2f} MB")
+            passed = sum(r.get('accepted',False) for r in value['rows'])
+            coverage = value.get('coverage', {})
+            allocation = (f"\n本网络学习 · 偏好 {coverage['preferred']} / 探索 {coverage['exploration']} / "
+                          f"复测 {coverage['reused']} · 深测探索 {coverage['validation_exploration']}"
+                          if 'preferred' in coverage else '')
+            self.scan_status.setText(f"优选完成 · {passed} 条通过真实验证 · 下载 {value['bytes']/1e6:.2f} MB"
+                                     + (' · 全部未通过，请查看测试详情中的失败原因' if not passed else '') + allocation)
+            self.status.setText(self.scan_status.text())
         elif kind=='scan_idle':
             self.scan_busy=False
             self.scan_button.setEnabled(True)

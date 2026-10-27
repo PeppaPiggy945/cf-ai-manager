@@ -7,6 +7,7 @@ import hashlib
 import http.client
 import ipaddress
 import json
+import math
 from pathlib import Path
 import random
 import secrets
@@ -20,6 +21,7 @@ import time
 
 from .clash import API, ControllerError
 from .config import atomic_json, read_json
+from .discovery import EXPLORATION_SHARE, PrefixLearning
 from .health import rank_results
 from .network import DirectNetwork
 from .speed import Budget, Cancelled, download, round_orders, summarize
@@ -170,7 +172,9 @@ def sample(ranges, excluded, cursor, count):
     index = cursor
     while len(ips) < count and index < cursor + count * 20:
         n = ranges[index % len(ranges)]
-        position = ((index // len(ranges)) * 2654435761 + 73) % n.num_addresses
+        # Independent prefix offsets avoid probing the same suffix in every range.
+        offset = int.from_bytes(hashlib.sha256(str(n).encode()).digest()[:4], 'big')
+        position = ((index // len(ranges)) * 2654435761 + offset) % n.num_addresses
         ip = str(n.network_address + position)
         if ip not in seen and position % 256 not in (0, 255):
             ips.append(ip)
@@ -179,8 +183,10 @@ def sample(ranges, excluded, cursor, count):
     return ips, index
 
 
-def shortlist(rows, maximum, settings, previous):
+def shortlist(rows, maximum, settings, previous, exploration=None):
     selected = []
+    def prefix(row):
+        return next((n for n in RANGES if ipaddress.IPv4Address(row['ip']) in ipaddress.ip_network(n)), row['ip'])
     def take(source, count):
         added = 0
         for row in source:
@@ -189,11 +195,28 @@ def shortlist(rows, maximum, settings, previous):
             if row not in selected:
                 selected.append(row)
                 added += 1
+    if exploration:
+        # Keep fresh exploration in the expensive stage even when history/latency fills all other slots.
+        reserve = math.ceil(min(maximum, len(rows)) * EXPLORATION_SHARE)
+        distinct, seen = [], set()
+        for row in exploration:
+            if prefix(row) not in seen:
+                distinct.append(row)
+                seen.add(prefix(row))
+        take(distinct, reserve)
+        take(exploration, max(0, reserve - len(selected)))
     take(sorted(rows, key=lambda r: r['median_ms']), max(1, round(maximum * settings.latency_share)))
     reputation = {r['ip']: r.get('score') or 0 for r in previous if r.get('accepted')}
     take(sorted([r for r in rows if r['ip'] in reputation], key=lambda r: -reputation[r['ip']]), round(maximum * settings.history_share))
     shuffled = list(rows)
     random.shuffle(shuffled)
+    # Reserve exploration for prefixes not yet represented by latency/history picks.
+    represented = {prefix(r) for r in selected}
+    for row in shuffled:
+        key = prefix(row)
+        if key not in represented and len(selected) < maximum:
+            selected.append(row)
+            represented.add(key)
     take(shuffled, maximum)
     return selected
 
@@ -236,11 +259,15 @@ class Scanner:
         # Same-network successes may be retested; recent failed candidates are excluded.
         recent = state.get('recent', {}) if state.get('network') == network_key else {}
         excluded = {ip for ip, at in recent.items() if 0 <= time.time() - at < 30 * 86400}
-        ips, cursor = sample(ranges, excluded, state.get('cursor', 0), s.sample_count)
-        seeds = list(dict.fromkeys([*(seed_ips or []), *[r['ip'] for r in previous if r.get('accepted')]]))
-        seeds = [ip for ip in seeds if any(ipaddress.IPv4Address(ip) in n for n in ranges)]
-        ips = list(dict.fromkeys(seeds + ips))[:s.sample_count]
-        self.event('scan', f'TCP 初筛 · {len(ips)} 个入口 · {source}')
+        learning = PrefixLearning(folder / 'discovery.json', p, network.identity)
+        seeds = list(dict.fromkeys([*(seed_ips or []), *[r['ip'] for r in previous
+                                  if r.get('accepted') and r.get('network') == list(network.identity)]]))
+        ips, allocation = learning.plan(ranges, excluded, seeds, s.sample_count)
+        exploration_ips = set(allocation.pop('exploration_ips'))
+        coverage = {'ranges': len(ranges), 'pool_addresses': sum(n.num_addresses for n in ranges),
+                    'sampled': len(ips), 'tcp_passed': 0, 'validated': 0, 'rounds': 3, **allocation}
+        self.event('scan', f"TCP 初筛 · {len(ips)} 个入口 / {coverage['ranges']} 段 · "
+                   f"偏好 {coverage['preferred']} / 探索 {coverage['exploration']} / 复测 {coverage['reused']} · {source}")
         def tcp(ip):
             values = []
             for _ in range(3):
@@ -255,20 +282,32 @@ class Scanner:
             return {'ip': ip, 'median_ms': statistics.median(values)} if len(values) >= 2 else None
         screened = []
         with ThreadPoolExecutor(max_workers=s.tcp_workers) as pool:
-            for future in as_completed([pool.submit(tcp, ip) for ip in ips]):
+            for completed, future in enumerate(as_completed([pool.submit(tcp, ip) for ip in ips]), 1):
                 row = future.result()
                 if row:
                     screened.append(row)
+                if completed % s.tcp_workers == 0 or completed == len(ips):
+                    self.event('scan', f'TCP 初筛 · {completed}/{len(ips)} · {len(screened)} 个通过')
         if stopped():
             raise Cancelled()
         recent = {ip: at for ip, at in recent.items() if time.time() - at < 30 * 86400}
         recent.update({ip: time.time() for ip in ips})
-        atomic_json(folder / 'scan-state.json', {'network': network_key, 'cursor': cursor, 'recent': dict(list(recent.items())[-20000:])})
-        chosen = shortlist(screened, s.validation_candidates, s, previous)
+        atomic_json(folder / 'scan-state.json', {'network': network_key, 'cursor': state.get('cursor', 0),
+                                                'recent': dict(list(recent.items())[-20000:])})
+        learning.save()  # Sampling progress only; no tunnel evidence from partial tasks.
+        exploration = learning.validation_order([r for r in screened if r['ip'] in exploration_ips], ranges)
+        chosen = shortlist(screened, s.validation_candidates, s, previous, exploration=exploration)
+        coverage.update(tcp_passed=len(screened), validated=len(chosen))
+        coverage['validation_exploration'] = sum(r['ip'] in exploration_ips for r in chosen)
+        for net in ranges:
+            counts = coverage['prefixes'][str(net)]
+            counts['tcp_passed'] = sum(ipaddress.IPv4Address(r['ip']) in net for r in screened)
+            counts['validated'] = sum(ipaddress.IPv4Address(r['ip']) in net for r in chosen)
         if not chosen:
             raise ValueError('本轮没有入口通过 TCP 初筛，原节点池保持不变')
         self.event('scan', f'真实隧道验证 · {len(chosen)} 个候选 / 3 轮')
-        rows = [{'ip': r['ip'], 'samples': [], 'latency_samples': [], 'first_request_samples': [], 'sample_times': []} for r in chosen]
+        rows = [{'ip': r['ip'], 'samples': [], 'latency_samples': [], 'first_request_samples': [], 'sample_times': [],
+                 'probe_errors': [], 'scan_coverage': coverage} for r in chosen]
         nodes = [p.node(r['ip']) for r in rows]
         with isolated_core(nodes, network, stopped, deadline) as (test_api, proxy_port):
             def probe(row):
@@ -280,13 +319,16 @@ class Scanner:
                 return row, pair, time.time()
             for round_index in range(3):
                 with ThreadPoolExecutor(max_workers=s.validation_workers) as pool:
-                    for future in as_completed([pool.submit(probe, r) for r in rows]):
+                    for completed_count, future in enumerate(as_completed([pool.submit(probe, r) for r in rows]), 1):
                         row, pair, completed = future.result()
                         row['first_request_samples'].extend(v['first_request'] for v in pair)
                         row['latency_samples'].extend(v['latency'] for v in pair)
                         row['samples'].extend(v['first_request'] for v in pair)
                         row['sample_times'].extend([completed] * 2)
+                        row['probe_errors'].extend(v.get('error', '') for v in pair)
+                        self.event('scan', f'真实隧道验证 · 第 {round_index+1}/3 轮 · {completed_count}/{len(rows)} 个候选完成')
                 if round_index < 2:
+                    self.event('scan', f'验证间隔 · 等待 {s.validation_interval} 秒 · 可取消')
                     until = time.monotonic() + s.validation_interval
                     while time.monotonic() < until:
                         if stopped():
@@ -334,10 +376,15 @@ class Scanner:
             rows = rank_results(rows, s)
         if stopped():
             raise Cancelled()
+        self.event('scan', '验证已结束，正在复核物理网络并保存结果…')
         if DirectNetwork.discover().identity != network.identity:
             raise ValueError('出口网卡已变化，本轮结果已丢弃')
         network.verify(api, rows[0]['ip'], p.port)
+        if stopped():
+            raise Cancelled()
         rows.sort(key=lambda r: (not r['accepted'], -(r.get('score') or 0)))
         self.store.save_results(p, rows, network.identity)
-        self.event('scan_done', {'rows': rows, 'bytes': budget.used, 'network': list(network.identity)})
+        learning.record(rows, ranges)
+        learning.save()
+        self.event('scan_done', {'rows': rows, 'bytes': budget.used, 'network': list(network.identity), 'coverage': coverage})
         return rows, network.identity

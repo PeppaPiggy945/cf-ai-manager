@@ -1,4 +1,5 @@
 """Build an explicit-whitelist portable release. Never packages user profiles or results."""
+import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -12,6 +13,12 @@ ROOT=Path(__file__).resolve().parent
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output-dir', type=Path, default=ROOT/'dist',
+                        help='Separate release directory; preserves a running portable build')
+    args = parser.parse_args()
+    destination = args.output_dir.resolve()
+    work = ROOT/'build' if destination == (ROOT/'dist').resolve() else destination/'_build'
     sys.path.insert(0,str(ROOT))
     from cfai.scanner import core_path
     from cfai import __version__
@@ -24,12 +31,12 @@ def main():
         if not (resources/name).is_file():
             raise RuntimeError('Missing distribution notice/source: '+name)
     subprocess.run([sys.executable,'-m','PyInstaller','--noconfirm','--clean','--windowed','--onedir',
-        '--name','CFAIManager','--icon',str(resources/'icon.ico'),'--distpath',str(ROOT/'dist'),'--workpath',str(ROOT/'build'),
-        '--specpath',str(ROOT/'build'),'--add-data',f'{resources};resources',
+        '--name','CFAIManager','--icon',str(resources/'icon.ico'),'--distpath',str(destination),'--workpath',str(work),
+        '--specpath',str(work),'--add-data',f'{resources};resources',
         '--exclude-module','PySide6.QtWebEngineCore','--exclude-module','PySide6.QtWebEngineWidgets',
         '--exclude-module','PySide6.QtQml','--exclude-module','PySide6.QtQuick',
         '--exclude-module','numpy','--exclude-module','pandas',str(ROOT/'app.py')],cwd=ROOT,check=True)
-    package=ROOT/'dist'/'CFAIManager'
+    package=destination/'CFAIManager'
     for name in ['README.md','THIRD_PARTY_NOTICES.md','LICENSE.txt']:
         shutil.copy2(ROOT/name,package/name)
     third=package/'third_party'
@@ -57,7 +64,7 @@ def main():
                 raise RuntimeError('Runtime user data entered release')
             manifest[relative]=hashlib.sha256(path.read_bytes()).hexdigest()
     (package/'SHA256SUMS.json').write_text(json.dumps(manifest,indent=2),encoding='utf-8')
-    archive=ROOT/'dist'/f'CFAIManager-{__version__}-windows-x64.zip'
+    archive=destination/f'CFAIManager-{__version__}-windows-x64.zip'
     with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=6) as z:
         for path in sorted(package.rglob('*')):
             if path.is_file():z.write(path,Path('CFAIManager')/path.relative_to(package))

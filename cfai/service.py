@@ -54,6 +54,8 @@ class Service:
         self.scan_thread = None
         self.scan_id = None
         self.scan_auto = False
+        self.task_lock = threading.Lock()
+        self.task_requested = False
         self.sessions = {}
         self.network = None
         self.network_checked = 0
@@ -67,13 +69,26 @@ class Service:
 
     @property
     def scanning(self):
-        return self.scan_thread is not None and self.scan_thread.is_alive()
+        # Keep ownership until the manager has joined the worker and published its outcome.
+        return self.scan_thread is not None
 
     def start(self):
         self.thread.start()
 
     def submit(self, action, *args):
+        if action in ('scan', 'stream'):
+            with self.task_lock:
+                if self.task_requested or self.scanning:
+                    return False
+                self.task_requested = True
+        if action == 'cancel':
+            # Cancellation must not wait behind synchronous health probes or queued clicks.
+            self.scan_cancel.set()
         self.commands.put((action, args))
+        return True
+
+    def monitor_interrupted(self):
+        return self.stop_event.is_set() or not self.commands.empty()
 
     def notify(self, kind, value):
         self.emit(kind, value)
@@ -101,10 +116,13 @@ class Service:
                 pass
             if self.stop_event.is_set():
                 break
-            try:
-                self.monitor()
-            except Exception as exc:
-                self.logger.info('monitor_wait %s', type(exc).__name__)
+            if self.commands.empty():
+                try:
+                    self.monitor()
+                except Cancelled:
+                    pass
+                except Exception as exc:
+                    self.logger.info('monitor_wait %s', type(exc).__name__)
         self.scan_cancel.set()
         if self.scan_thread:
             self.scan_thread.join(timeout=35)
@@ -126,7 +144,18 @@ class Service:
                 session.last_tick = 0
             self.notify('profiles', [p.to_dict() for p in self.profiles])
         elif action == 'scan':
-            self.start_scan(self.profile(args[0]), with_download=args[1])
+            try:
+                if self.scanning:
+                    self.notify('scan_started', self.scan_id)
+                else:
+                    self.start_scan(self.profile(args[0]), with_download=args[1])
+            except Exception:
+                if not self.scanning:
+                    self.notify('scan_idle', args[0])
+                raise
+            finally:
+                with self.task_lock:
+                    self.task_requested = False
         elif action == 'cancel':
             self.scan_cancel.set()
         elif action == 'resume':
@@ -201,10 +230,10 @@ class Service:
             instance, fingerprint, rows, network, automatic = args
             p = self.profile(instance)
             if p.measurement_key() != fingerprint:
-                return
+                return False
             if list(DirectNetwork.discover().identity) != list(network):
                 self.notify('notice', '优选结束后网络已变化，本轮结果不会发布；请在当前网络重新优选')
-                return
+                return False
             session = self.sessions.get(instance)
             if session and self.network and list(self.network) == list(network):
                 for row in rows:
@@ -214,8 +243,44 @@ class Service:
             if automatic:
                 self.publish_discovery(p, rows)
             self.notify('results', instance)
+            return True
         elif action == 'stream':
-            self.start_stream(self.profile(args[0]))
+            try:
+                if self.scanning:
+                    self.notify('scan_started', self.scan_id)
+                else:
+                    self.start_stream(self.profile(args[0]))
+            except Exception:
+                if not self.scanning:
+                    self.notify('scan_idle', args[0])
+                raise
+            finally:
+                with self.task_lock:
+                    self.task_requested = False
+        elif action == 'task_complete':
+            instance, outcome = args
+            # Workers enqueue this only after core cleanup and schedule persistence.
+            self.scan_thread.join()
+            try:
+                if outcome[0] == 'done':
+                    _, fingerprint, rows, network, automatic, summary = outcome
+                    if self.command('scan_finished', instance, fingerprint, rows, network, automatic):
+                        coverage = summary.get('coverage', {})
+                        self.logger.info('scan_done %s sampled=%s validated=%s accepted=%s', instance,
+                                         coverage.get('sampled'), coverage.get('validated'),
+                                         sum(bool(r.get('accepted')) for r in rows))
+                        self.notify('scan_done', summary)
+                    else:
+                        self.notify('scan', '任务已结束，配置或网络已变化；请重新优选')
+                elif outcome[0] == 'cancelled':
+                    self.notify('scan_cancelled', instance)
+                else:
+                    self.notify(outcome[0], outcome[1])
+            finally:
+                self.scan_thread = None
+                self.scan_id, self.scan_auto = None, False
+                self.logger.info('task_idle %s %s', instance, outcome[0])
+                self.notify('scan_idle', instance)
 
     def start_scan(self, p, with_download=True, automatic=False, expected=None):
         if self.scanning:
@@ -230,6 +295,7 @@ class Service:
         except ValueError:
             seeds = []
         self.notify('scan_started', p.id)
+        self.logger.info('scan_started %s %s', p.id, 'automatic' if automatic else 'manual')
         finished = threading.Event()
         def watch():
             while not finished.wait(1) and not cancel.is_set() and not self.stop_event.is_set():
@@ -241,26 +307,44 @@ class Service:
         if automatic:
             threading.Thread(target=watch, name='cfai-scan-watchdog', daemon=True).start()
         def work():
-            schedule = read_json(self.store.folder(p.id) / 'schedule.json', {})
+            schedule = {}
+            outcome = ('error', '优选未能完成')
+            summary = {}
+            def event(kind, value):
+                if kind == 'scan_done':
+                    summary.update(value)
+                else:
+                    self.notify(kind, value)
             try:
-                rows, network = Scanner(self.store, p, self.notify).run(lambda: cancel.is_set() or self.stop_event.is_set(), with_download, seeds)
+                schedule = read_json(self.store.folder(p.id) / 'schedule.json', {})
+                rows, network = Scanner(self.store, p, event).run(lambda: cancel.is_set() or self.stop_event.is_set(), with_download, seeds)
                 schedule.update(last_success=time.time(), failures=0, next_allowed=time.time() + p.settings.replenish_seconds)
-                self.submit('scan_finished', p.id, p.measurement_key(), rows, network, automatic)
+                outcome = ('done', p.measurement_key(), rows, network, automatic, summary)
             except Cancelled:
-                self.notify('scan_cancelled', p.id)
+                outcome = ('cancelled',)
                 schedule['next_allowed'] = time.time() + p.settings.replenish_seconds
             except Exception as exc:
                 failures = min(schedule.get('failures', 0) + 1, 10)
                 schedule.update(failures=failures, next_allowed=time.time() + min(7200, 900 * 2**min(failures-1, 3)))
                 message = str(exc) if isinstance(exc, (ValueError, ControllerError)) else f'优选失败（{type(exc).__name__}）'
-                self.notify('error', message)
+                outcome = ('error', message)
                 self.logger.info('scan_failed %s', type(exc).__name__)
             finally:
-                atomic_json(self.store.folder(p.id) / 'schedule.json', schedule)
-                finished.set()
-                self.notify('scan_idle', p.id)
+                try:
+                    atomic_json(self.store.folder(p.id) / 'schedule.json', schedule)
+                except Exception as exc:
+                    outcome = ('error', '任务已结束，但保存调度记录失败；请检查数据目录')
+                    self.logger.info('schedule_failed %s', type(exc).__name__)
+                finally:
+                    finished.set()
+                    self.submit('task_complete', p.id, outcome)
         self.scan_thread = threading.Thread(target=work, name='cfai-scan', daemon=False)
-        self.scan_thread.start()
+        try:
+            self.scan_thread.start()
+        except Exception:
+            finished.set()
+            self.scan_thread = None
+            raise
 
     def monitor(self):
         managed = [p for p in self.profiles if p.managed]
@@ -284,7 +368,7 @@ class Service:
         if self.network is None:
             return
         for p in managed:
-            if self.stop_event.is_set():
+            if self.monitor_interrupted():
                 return
             session = self.sessions.get(p.id)
             if session is None or session.key != context_key(p, self.network):
@@ -294,6 +378,9 @@ class Service:
             session.last_tick = now
             try:
                 self.tick(p, session)
+            except Cancelled:
+                session.last_tick = 0
+                return
             except ControllerError:
                 session.state = 'unknown'
                 session.policy.reset()
@@ -304,14 +391,21 @@ class Service:
                 self.notify('state', {'id': p.id, 'state': 'error', 'message': str(exc) if isinstance(exc, ValueError) else '本机文件暂不可读'})
 
     def probe(self, api, p, name, cancelled=lambda: False):
-        if self.stop_event.is_set() or cancelled():
-            raise ControllerError('探测已取消')
-        stop = lambda: self.stop_event.is_set() or cancelled()
+        if self.monitor_interrupted() or cancelled():
+            raise Cancelled()
+        stop = lambda: self.monitor_interrupted() or cancelled()
         measurement = api.measure(name, p.settings.probe_urls[0], p.settings.timeout_ms, stop)
+        if stop():
+            raise Cancelled()
         if measurement['first_request'] is None:
-            if self.stop_event.wait(p.settings.confirmation_seconds) or cancelled():
-                raise ControllerError('探测已取消')
+            until = time.monotonic() + p.settings.confirmation_seconds
+            while time.monotonic() < until:
+                if stop():
+                    raise Cancelled()
+                self.stop_event.wait(min(.1, max(0, until - time.monotonic())))
             measurement = api.measure(name, p.settings.probe_urls[1], p.settings.timeout_ms, stop)
+        if stop():
+            raise Cancelled()
         return measurement
 
     def tick(self, p, session):
@@ -344,7 +438,7 @@ class Service:
         if self.network is not None and tuple(network.identity) != tuple(self.network):
             self.network_checked = 0
             raise ControllerError('物理出口已变化，等待重新收集样本')
-        with isolated_core(nodes, network, self.stop_event.is_set, time.monotonic() + 600) as (probe_api, _):
+        with isolated_core(nodes, network, self.monitor_interrupted, time.monotonic() + 600) as (probe_api, _):
             self.tick_probes(p, session, api, probe_api, names, current, network.identity)
 
     def tick_probes(self, p, session, api, probe_api, names, current, network):
@@ -383,7 +477,7 @@ class Service:
                 if decision['reason'] != 'failure' or recovered['first_request'] is None:
                     final = api.snapshot(p)
                     same_network = tuple(DirectNetwork.discover().identity) == tuple(network)
-                    if guard(final, p) == ('cf', current) and not self.stop_event.is_set() and same_network:
+                    if guard(final, p) == ('cf', current) and not self.monitor_interrupted() and same_network:
                         if decision['reason'] == 'optimization' and p.settings.protect_activity:
                             busy = session.activity.busy(api.connections(), p, time.time(), p.settings.idle_seconds)
                         refreshed = scores(session.history, names, p.settings, time.time())
@@ -414,7 +508,7 @@ class Service:
                              'message': '手动保持：继续监测与发现，不自动切换；点击“恢复自动管理”解除保持' if session.hold else
                                         '综合优化已开启' if p.optimize else '健康时保持线路，仅故障切换'})
         self.persist(p, session)
-        if (not self.scanning and not self.stop_event.is_set() and now >= schedule.get('next_allowed', 0)
+        if (not self.scanning and not self.monitor_interrupted() and now >= schedule.get('next_allowed', 0)
                 and (now - schedule.get('last_success', 0) >= p.settings.daily_seconds or replenish)):
             self.start_scan(p, p.settings.background_bandwidth, automatic=True, expected=session.current)
 
@@ -468,14 +562,19 @@ class Service:
         cancel = self.scan_cancel
         self.notify('scan_started', p.id)
         def work():
+            outcome = ('error', '诊断未能完成')
             try:
-                result = stream_diagnostic(p, self.store.results(p), cancel.is_set, self.notify)
-                self.notify('notice', result)
+                result = stream_diagnostic(p, self.store.results(p), lambda: cancel.is_set() or self.stop_event.is_set(), self.notify)
+                outcome = ('notice', result)
             except Cancelled:
-                self.notify('scan_cancelled', p.id)
+                outcome = ('cancelled',)
             except Exception as exc:
-                self.notify('error', str(exc) if isinstance(exc, ValueError) else f'诊断失败（{type(exc).__name__}）')
+                outcome = ('error', str(exc) if isinstance(exc, ValueError) else f'诊断失败（{type(exc).__name__}）')
             finally:
-                self.notify('scan_idle', p.id)
+                self.submit('task_complete', p.id, outcome)
         self.scan_thread = threading.Thread(target=work, name='cfai-diagnostic', daemon=False)
-        self.scan_thread.start()
+        try:
+            self.scan_thread.start()
+        except Exception:
+            self.scan_thread = None
+            raise

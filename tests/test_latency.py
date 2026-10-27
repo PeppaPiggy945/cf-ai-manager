@@ -71,7 +71,10 @@ class PairedMeasurementTests(unittest.TestCase):
                 self.assertIsNotNone(closed['first_request'])
                 self.assertIsNone(closed['latency'])
                 self.assertIsNotNone(api.measure('good', url + '/close-second', 2000)['latency'])
-                self.assertEqual(api.measure('good', url + '/blocked', 2000), {'latency': None, 'first_request': None})
+                blocked = api.measure('good', url + '/blocked', 2000)
+                self.assertIsNone(blocked['first_request'])
+                self.assertIsNone(blocked['latency'])
+                self.assertIn('HTTP 403', blocked['error'])
                 with self.assertRaises(Cancelled):
                     api.measure('good', url + '/204', 2000, lambda: True)
             # Untrusted certificates must still fail in the real default TLS context.

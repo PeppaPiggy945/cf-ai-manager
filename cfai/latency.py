@@ -39,14 +39,20 @@ def measure_pair(port, url, timeout_ms, cancelled=lambda: False):
             if cancelled():
                 raise Cancelled()
             if response.status != 204 or not 0 < elapsed <= timeout_ms:
+                result['error'] = f'HTTP {response.status}（预期 204）' if response.status != 204 else '请求超过时限'
                 break
             if metric == 'latency' and request_socket is not previous_socket:
                 break
             result[metric] = elapsed
     except ConnectionRefusedError:
         raise
-    except (OSError, http.client.HTTPException):
-        pass
+    except ssl.SSLCertVerificationError:
+        result['error'] = 'TLS 证书校验失败'
+    except TimeoutError:
+        result['error'] = '请求超时'
+    except (OSError, http.client.HTTPException) as exc:
+        # Never persist exception text: CONNECT errors may include arbitrary server content.
+        result['error'] = f'隧道或 HTTPS 请求失败（{type(exc).__name__}）'
     finally:
         connection.close()
     return result

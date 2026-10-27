@@ -46,6 +46,31 @@ class GenerationUITests(unittest.TestCase):
         open_url.assert_not_called()
         self.assertIn(destination, self.window.status.text())
 
+    def test_scan_claims_ui_before_dispatch_and_ignores_repeated_clicks(self):
+        self.window.service = Mock()
+        self.addCleanup(lambda: setattr(self.window, 'service', None))
+        self.window.scan()
+        self.window.scan()
+        self.window.command('stream')
+        self.assertTrue(self.window.scan_busy)
+        self.assertFalse(self.window.scan_button.isEnabled())
+        self.assertTrue(self.window.cancel_button.isEnabled())
+        self.window.service.submit.assert_called_once_with('scan', self.profile.id, True)
+        self.window.handle_event('scan_done', {'rows': [], 'bytes': 0})
+        self.assertFalse(self.window.scan_button.isEnabled())
+        self.window.handle_event('scan_idle', self.profile.id)
+        self.assertTrue(self.window.scan_button.isEnabled())
+        self.assertFalse(self.window.cancel_button.isEnabled())
+
+    def test_scan_summary_shows_actual_learned_and_exploration_counts(self):
+        self.window.handle_event('scan_done', {'rows': [], 'bytes': 0,
+            'coverage': {'preferred': 169, 'exploration': 77, 'reused': 10, 'validation_exploration': 4}})
+        text = self.window.scan_status.text()
+        self.assertIn('偏好 169', text)
+        self.assertIn('探索 77', text)
+        self.assertIn('复测 10', text)
+        self.assertIn('深测探索 4', text)
+
     def test_hold_shows_live_metrics_and_distinguishes_probe_from_discovery(self):
         import time
         now=time.time();current='CF-104.16.1.1'
