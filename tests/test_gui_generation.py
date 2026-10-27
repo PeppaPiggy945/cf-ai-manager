@@ -67,6 +67,15 @@ class GenerationUITests(unittest.TestCase):
         self.window.show_state(state)
         self.assertEqual(self.window.metrics['latency'].text(),'待探测')
 
+    def test_startup_check_reports_windows_block_without_reenabling_it(self):
+        state={'registered':True,'correct':False,'legacy':True,'disabled':True,'path':'fixture.lnk'}
+        self.window.preferences['startup']=True
+        with patch.object(self.window,'demo',False), patch('cfai.gui.sys.frozen',True,create=True), \
+             patch('cfai.startup.inspect',return_value=state), patch('cfai.startup.configure') as configure:
+            self.window.refresh_startup(migrate=True)
+        configure.assert_not_called()
+        self.assertIn('Windows 已禁用',self.window.startup_status.text())
+
 
 if __name__ == '__main__':
     unittest.main()

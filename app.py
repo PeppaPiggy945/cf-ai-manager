@@ -6,15 +6,39 @@ import sys
 import tempfile
 import time
 
+_BOOT_ROOT = None
+_BOOT_STATE = {}
+
+
+def record_startup(phase, error=None):
+    if _BOOT_ROOT is None:
+        return
+    from cfai.config import atomic_json
+    _BOOT_STATE.update(phase=phase, updated_at=time.time())
+    if error:
+        _BOOT_STATE['error_type'] = error
+    try:
+        atomic_json(_BOOT_ROOT/'last-startup.json', _BOOT_STATE)
+    except OSError:
+        pass
+
 
 def main():
+    global _BOOT_ROOT
     parser=argparse.ArgumentParser(description='澄流 · CF AI Manager')
     parser.add_argument('--data-dir',type=Path)
     parser.add_argument('--tray',action='store_true')
+    parser.add_argument('--autostart',action='store_true',help='Windows logon entry; starts to the tray')
     parser.add_argument('--self-test',action='store_true')
     parser.add_argument('--render-demo',type=Path)
     parser.add_argument('--theme',choices=['light','dark'],default='light')
     args=parser.parse_args()
+    if args.autostart:
+        args.tray=True
+    if not args.self_test and not args.render_demo:
+        _BOOT_ROOT=(args.data_dir or Path(os.environ.get('LOCALAPPDATA',Path.home()))/'CFAIManager').resolve()
+        _BOOT_STATE.update(started_at=time.time(),pid=os.getpid(),mode='autostart' if args.autostart else 'manual')
+        record_startup('starting')
     if args.self_test or args.render_demo:
         os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
     from PySide6.QtCore import QLockFile, QTimer, Qt
@@ -42,11 +66,14 @@ def main():
         store=Store(Path(temporary.name))
     else:
         store=Store(args.data_dir)
+        record_startup('protecting_data')
         store.protect()
     lock=QLockFile(str(store.root/'application.lock'))
     lock.setStaleLockTime(30000)
     if not lock.tryLock(100):
-        QMessageBox.information(None,'澄流','此数据目录已有澄流实例运行，请从系统托盘打开。')
+        record_startup('already_running')
+        if not args.autostart:
+            QMessageBox.information(None,'澄流','此数据目录已有澄流实例运行，请从系统托盘打开。')
         return 0
     if args.self_test or args.render_demo:
         p=Profile('我的 AI 线路','node.demo.invalid','11111111-2222-4333-8444-555555555555',managed=False)
@@ -59,11 +86,13 @@ def main():
         store.save_results(p,rows,['demo'])
         atomic_json(store.root/'preferences.json',{'theme':args.theme,'startup':False})
     try:
+        record_startup('building_window')
         window=Window(store,demo=bool(args.self_test or args.render_demo))
     except Exception as exc:
         lock.unlock()
         if args.self_test or args.render_demo:
             raise
+        record_startup('failed',type(exc).__name__)
         QMessageBox.critical(None,'澄流启动未完成',f'本机配置暂不可读，原文件已保留。\n{type(exc).__name__}\n数据目录：{store.root}')
         return 1
     if args.self_test:
@@ -122,12 +151,18 @@ def main():
             if window.service.thread.is_alive():
                 window.service.thread.join(timeout=45)
         lock.unlock()
+        record_startup('stopped')
     application.aboutToQuit.connect(exiting)
     if not args.tray or not window.tray:
         window.show()
     application.styleHints().colorSchemeChanged.connect(lambda *_: window.apply_theme())
+    record_startup('running')
     return application.exec()
 
 
 if __name__=='__main__':
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except Exception as exc:
+        record_startup('failed',type(exc).__name__)
+        raise

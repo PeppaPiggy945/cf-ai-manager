@@ -480,6 +480,7 @@ class Window(QMainWindow):
         if store.recovery_note:
             self.status.setText(store.recovery_note)
         if not demo:
+            self.refresh_startup(migrate=True)
             self.create_tray()
             self.service.start()
 
@@ -653,8 +654,14 @@ class Window(QMainWindow):
         self.startup=QCheckBox('登录 Windows 时启动到托盘')
         self.startup.setChecked(self.preferences.get('startup',False))
         self.startup.toggled.connect(self.set_startup)
-        form.addRow('开机启动',self.startup)
+        startup_row=QHBoxLayout()
+        startup_row.addWidget(self.startup)
+        startup_row.addWidget(button('检查 / 修复',lambda: self.refresh_startup(migrate=True),'quiet'))
+        form.addRow('开机启动',startup_row)
         body.addLayout(form)
+        self.startup_status=label('登录启动状态尚未检查','muted')
+        self.startup_status.setWordWrap(True)
+        body.addWidget(self.startup_status)
         body.addWidget(label('关闭窗口进入托盘；从托盘选择退出会停止本工具，Clash 保持最后线路。','muted'))
         layout.addWidget(frame)
         row=QHBoxLayout()
@@ -951,19 +958,39 @@ class Window(QMainWindow):
         if self.demo: return
         try:
             if not getattr(sys,'frozen',False): raise ValueError('开机启动请使用打包后的 EXE')
-            import winreg
-            with winreg.CreateKey(winreg.HKEY_CURRENT_USER,r'Software\Microsoft\Windows\CurrentVersion\Run') as key:
-                if enabled: winreg.SetValueEx(key,'CFAIManager',0,winreg.REG_SZ,f'"{sys.executable}" --tray')
-                else:
-                    try: winreg.DeleteValue(key,'CFAIManager')
-                    except FileNotFoundError: pass
+            from .startup import configure,describe
+            state=configure(enabled,sys.executable,self.store.root)
             self.preferences['startup']=enabled
             atomic_json(self.store.root/'preferences.json',self.preferences)
+            self.startup_status.setText(describe(state))
         except (OSError,ValueError) as exc:
             self.startup.blockSignals(True)
             self.startup.setChecked(not enabled)
             self.startup.blockSignals(False)
             self.message(str(exc),True)
+
+    def refresh_startup(self,migrate=False):
+        if self.demo:
+            self.startup_status.setText('演示模式，不创建登录启动项。')
+            return
+        if not getattr(sys,'frozen',False):
+            self.startup_status.setText('源码模式；请使用便携 EXE 设置登录启动。')
+            return
+        try:
+            from .startup import inspect,configure,describe
+            state=inspect(sys.executable,self.store.root)
+            if migrate and self.preferences.get('startup') and not state['disabled'] and (not state['correct'] or state['legacy']):
+                state=configure(True,sys.executable,self.store.root)
+            self.startup.blockSignals(True)
+            self.startup.setChecked(state['registered'])
+            self.startup.blockSignals(False)
+            text=describe(state)
+            recent=read_json(self.store.root/'last-startup.json',{})
+            if recent.get('started_at'):
+                text+='\n本次启动：'+time.strftime('%m-%d %H:%M:%S',time.localtime(recent['started_at']))+' · '+('登录启动入口' if recent.get('mode')=='autostart' else '手动启动')
+            self.startup_status.setText(text)
+        except (OSError,ValueError) as exc:
+            self.startup_status.setText('登录启动检查未完成：'+str(exc))
 
     def create_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable(): return

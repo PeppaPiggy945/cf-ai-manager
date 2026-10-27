@@ -19,6 +19,7 @@ observations.json
 pool.json
 pool-transaction.json
 preferences.json
+last-startup.json
 settings.json
 node_template.json
 instances/
