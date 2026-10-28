@@ -828,13 +828,14 @@ class Window(QMainWindow):
                 destination+='.yaml'
             self.command('dynamic',destination)
 
-    def generated(self, path):
-        self.status.setText('动态配置已生成：'+str(path))
+    def generated(self, path, publication=None):
+        self.status.setText('动态配置已生成：'+str(path)+ ('\n'+publication if publication else ''))
         dialog=QMessageBox(self)
         dialog.setWindowTitle('动态配置已生成')
         dialog.setIcon(QMessageBox.Information)
         dialog.setText('在 Clash Verge 的订阅 / 配置页面导入并启用此文件，再选择本实例的 CF 组。')
-        dialog.setInformativeText(str(path)+'\n\n动态管理需要本工具持续运行。文件引用本机节点池，请保留本工具的数据目录。')
+        dialog.setInformativeText(str(path)+ ('\n\n'+publication if publication else '')
+                                  +'\n\n动态管理需要本工具持续运行。文件引用本机节点池，请保留本工具的数据目录。')
         dialog.setTextInteractionFlags(Qt.TextSelectableByMouse)
         copy_button=dialog.addButton('复制文件路径',QMessageBox.ActionRole)
         copy_button.clicked.connect(lambda: QApplication.clipboard().setText(str(path)))
@@ -910,7 +911,8 @@ class Window(QMainWindow):
                           f"复测 {coverage['reused']} · 深测探索 {coverage['validation_exploration']}"
                           if 'preferred' in coverage else '')
             self.scan_status.setText(f"优选完成 · {passed} 条通过真实验证 · 下载 {value['bytes']/1e6:.2f} MB"
-                                     + (' · 全部未通过，请查看测试详情中的失败原因' if not passed else '') + allocation)
+                                     + (' · 全部未通过，请查看测试详情中的失败原因' if not passed else '') + allocation
+                                     + ('\n' + value['publication'] if value.get('publication') else ''))
             self.status.setText(self.scan_status.text())
         elif kind=='scan_idle':
             self.scan_busy=False
@@ -924,7 +926,10 @@ class Window(QMainWindow):
         elif kind=='error': self.message(value,True)
         elif kind=='notice': self.message(value)
         elif kind=='generated':
-            self.generated(value)
+            if isinstance(value,dict):
+                self.generated(value['path'],value.get('publication'))
+            else:
+                self.generated(value)
         elif kind=='stopped' and self.quitting: QApplication.instance().quit()
 
     def show_state(self,state):

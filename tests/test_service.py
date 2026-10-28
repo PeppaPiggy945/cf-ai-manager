@@ -46,6 +46,7 @@ class ServiceTests(unittest.TestCase):
         self.p.settings.confirmation_seconds=0
         self.store.save_profiles([self.p])
         self.service=Service(self.store)
+        self.service.profiles=[self.p]
         self.addCleanup(self.service.handler.close)
         self.pool=NodePool(self.store.folder(self.p.id),self.p,Path(self.tmp.name)/'provider.json')
         self.pool.initialize([self.p.node('104.16.1.1'),self.p.node('104.16.1.2')])
@@ -170,6 +171,115 @@ class ServiceTests(unittest.TestCase):
         with patch('cfai.service.DirectNetwork.discover',return_value=SimpleNamespace(identity=('new-network',))):
             self.service.command('scan_finished',self.p.id,self.p.measurement_key(),[],['old-network'],True)
 
+    def scan_rows(self, *ips):
+        import time
+        return [{'ip':ip,'accepted':True,'validated_at':time.time(),'samples':[100]*6,'score':90-i}
+                for i,ip in enumerate(ips)]
+
+    def publication_api(self):
+        def update(*args):
+            import json
+            self.api.names=[n['name'] for n in json.loads(self.pool.provider_path.read_text())['proxies']]
+        self.api.update=update
+        return patch('cfai.service.API.discover',return_value=self.api), patch('cfai.service.NodePool',return_value=self.pool)
+
+    def test_manual_scan_refreshes_full_standby_pool_and_preserves_current(self):
+        self.p.managed=True;self.p.settings.target_pool=2
+        self.service.sessions[self.p.id]=self.session
+        current=self.api.current
+        api_patch,pool_patch=self.publication_api()
+        with api_patch,pool_patch:
+            message=self.service.command('scan_finished',self.p.id,self.p.measurement_key(),
+                                         self.scan_rows('104.16.1.3','104.16.1.4'),['network'],False)
+        self.assertIn('已同步',message)
+        self.assertEqual(self.api.names,[current,'CF-104.16.1.3'])
+        self.assertEqual(self.api.current,current)
+        self.assertEqual(self.api.selected,[])
+        self.assertFalse(self.pool.journal.exists())
+
+    def test_manual_refresh_keeps_connected_nodes_and_reports_no_capacity(self):
+        self.p.managed=True;self.p.settings.target_pool=2
+        self.service.sessions[self.p.id]=self.session
+        self.api.connections=lambda:[{'chains':[self.api.names[1],self.p.group]}]
+        before=self.pool.provider_path.read_bytes()
+        api_patch,pool_patch=self.publication_api()
+        with api_patch,pool_patch:
+            message=self.service.publish_discovery(self.p,self.scan_rows('104.16.1.3'),refresh=True)
+        self.assertIn('未变化',message)
+        self.assertEqual(before,self.pool.provider_path.read_bytes())
+
+    def test_automatic_discovery_still_preserves_healthy_full_pool(self):
+        self.p.managed=True;self.p.settings.target_pool=2
+        self.service.sessions[self.p.id]=self.session
+        before=self.pool.provider_path.read_bytes()
+        api_patch,pool_patch=self.publication_api()
+        with api_patch,pool_patch:
+            message=self.service.command('scan_finished',self.p.id,self.p.measurement_key(),
+                                         self.scan_rows('104.16.1.3'),['network'],True)
+        self.assertIn('未变化',message)
+        self.assertEqual(before,self.pool.provider_path.read_bytes())
+
+    def test_manual_completion_reports_hold_and_does_not_publish(self):
+        self.p.managed=True;self.session.hold=True
+        self.service.sessions[self.p.id]=self.session
+        before=self.pool.provider_path.read_bytes()
+        with patch('cfai.service.API.discover') as discover:
+            message=self.service.command('scan_finished',self.p.id,self.p.measurement_key(),
+                                         self.scan_rows('104.16.1.3'),['network'],False)
+        discover.assert_not_called()
+        self.assertIn('手动保持',message)
+        self.assertIn('恢复自动管理',message)
+        self.assertEqual(before,self.pool.provider_path.read_bytes())
+
+    def test_publish_restores_saved_hold_before_first_monitor_tick(self):
+        from cfai.config import atomic_json
+        self.p.managed=True
+        atomic_json(self.store.folder(self.p.id)/'observations.json',{'context':self.session.key,'hold':True})
+        with patch('cfai.service.API.discover') as discover:
+            message=self.service.publish_discovery(self.p,self.scan_rows('104.16.1.3'),refresh=True)
+        self.assertIn('手动保持',message)
+        discover.assert_not_called()
+
+    def test_manual_change_during_scan_enters_hold_before_pool_publication(self):
+        self.p.managed=True;self.session.expected=self.api.names[1]
+        self.service.sessions[self.p.id]=self.session
+        before=self.pool.provider_path.read_bytes()
+        api_patch,pool_patch=self.publication_api()
+        with api_patch,pool_patch:
+            message=self.service.publish_discovery(self.p,self.scan_rows('104.16.1.3'),refresh=True)
+        self.assertIn('手动切换',message)
+        self.assertTrue(self.session.hold)
+        self.assertEqual(before,self.pool.provider_path.read_bytes())
+
+    def test_refresh_with_no_accepted_nodes_preserves_existing_pool(self):
+        self.p.managed=True
+        self.service.sessions[self.p.id]=self.session
+        before=self.pool.provider_path.read_bytes()
+        api_patch,pool_patch=self.publication_api()
+        with api_patch,pool_patch:
+            message=self.service.publish_discovery(self.p,[{'ip':'104.16.1.3','accepted':False}],refresh=True)
+        self.assertIn('没有通过验证',message)
+        self.assertEqual(before,self.pool.provider_path.read_bytes())
+
+    def test_publication_failure_keeps_completed_measurement_and_results_event(self):
+        events=[];self.service.emit=lambda *args:events.append(args)
+        with patch.object(self.service,'publish_discovery',side_effect=ControllerError('fixture')):
+            message=self.service.command('scan_finished',self.p.id,self.p.measurement_key(),
+                                         self.scan_rows('104.16.1.3'),['network'],False)
+        self.assertIn('未同步',message)
+        self.assertIn(('results',self.p.id),events)
+
+    def test_network_change_at_publication_guard_leaves_pool_untouched(self):
+        self.p.managed=True;self.p.settings.target_pool=2
+        self.service.sessions[self.p.id]=self.session
+        before=self.pool.provider_path.read_bytes()
+        api_patch,pool_patch=self.publication_api()
+        with api_patch,pool_patch,patch('cfai.service.DirectNetwork.discover',side_effect=[
+                SimpleNamespace(identity=('network',)),SimpleNamespace(identity=('other-network',))]):
+            with self.assertRaises(ControllerError):
+                self.service.publish_discovery(self.p,self.scan_rows('104.16.1.3'),refresh=True)
+        self.assertEqual(before,self.pool.provider_path.read_bytes())
+
     def test_unknown_controller_blocks_dynamic_provider_overwrite(self):
         import time
         rows=[{'ip':ip,'accepted':True,'validated_at':time.time(),'samples':[100]*6,'score':90} for ip in ['104.16.1.1','104.16.1.2']]
@@ -238,6 +348,41 @@ class ServiceTests(unittest.TestCase):
                     with self.assertRaises(ValueError):self.service.command('dynamic',self.p.id,str(destination))
                 self.assertFalse(destination.exists())
                 self.assertEqual(before,self.pool.provider_path.read_bytes())
+
+    def test_regenerate_active_dynamic_uses_latest_results_even_during_manual_hold(self):
+        import json
+        self.p.settings.target_pool=2
+        self.session=Session(self.p,self.store,['network'])
+        self.session.hold=True
+        self.service.sessions[self.p.id]=self.session
+        self.store.save_results(self.p,self.scan_rows('104.16.1.3','104.16.1.4'),['network'])
+        events=[];self.service.emit=lambda *args:events.append(args)
+        destination=Path(self.tmp.name)/'regenerated.yaml'
+        current=self.api.current
+        api_patch,pool_patch=self.publication_api()
+        with api_patch,pool_patch:
+            self.service.command('dynamic',self.p.id,str(destination))
+        self.assertEqual(self.api.names,[current,'CF-104.16.1.3'])
+        provider=json.loads(self.pool.provider_path.read_text())
+        self.assertEqual([n['name'] for n in provider['proxies']],self.api.names)
+        self.assertEqual(self.pool.nodes(),provider['proxies'])
+        self.assertEqual(self.api.current,current)
+        self.assertEqual(self.api.selected,[])
+        self.assertTrue(self.session.hold)
+        self.assertFalse(self.p.managed)
+        self.assertEqual(events[-1][0],'generated')
+        self.assertIn('已同步',events[-1][1]['publication'])
+        config=json.loads(destination.read_text(encoding='utf-8'))
+        self.assertEqual(Path(config['proxy-providers'][self.p.provider]['path']),self.pool.provider_path)
+
+    def test_regenerate_write_failure_does_not_refresh_active_pool(self):
+        self.store.save_results(self.p,self.scan_rows('104.16.1.3'),['network'])
+        before=self.pool.provider_path.read_bytes()
+        api_patch,pool_patch=self.publication_api()
+        with api_patch,pool_patch,patch('cfai.service.write_yaml',side_effect=PermissionError('fixture')):
+            with self.assertRaises(PermissionError):
+                self.service.command('dynamic',self.p.id,str(Path(self.tmp.name)/'regenerated.yaml'))
+        self.assertEqual(before,self.pool.provider_path.read_bytes())
 
 
 if __name__=='__main__': unittest.main()

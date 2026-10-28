@@ -46,6 +46,14 @@ class GenerationUITests(unittest.TestCase):
         open_url.assert_not_called()
         self.assertIn(destination, self.window.status.text())
 
+    def test_regenerated_notice_shows_provider_refresh_outcome(self):
+        destination = str(Path(self.temp.name) / 'dynamic.yaml')
+        publication = '动态配置已同步：8 条节点，保留当前线路及活动连接'
+        with patch('cfai.gui.QMessageBox.exec', return_value=0):
+            self.window.handle_event('generated', {'path': destination, 'publication': publication})
+        self.assertIn(destination, self.window.status.text())
+        self.assertIn(publication, self.window.status.text())
+
     def test_scan_claims_ui_before_dispatch_and_ignores_repeated_clicks(self):
         self.window.service = Mock()
         self.addCleanup(lambda: setattr(self.window, 'service', None))
@@ -91,6 +99,13 @@ class GenerationUITests(unittest.TestCase):
         state['stats'][current].update(fresh=False)
         self.window.show_state(state)
         self.assertEqual(self.window.metrics['latency'].text(),'待探测')
+
+    def test_scan_completion_displays_dynamic_publication_outcome(self):
+        for message in ['动态配置已同步：8 条节点', '动态配置未同步：手动保持中，请恢复自动管理']:
+            with self.subTest(message=message):
+                self.window.handle_event('scan_done', {'rows': [], 'bytes': 0, 'publication': message})
+                self.assertIn(message, self.window.scan_status.text())
+                self.assertIn(message, self.window.status.text())
 
     def test_startup_check_reports_windows_block_without_reenabling_it(self):
         state={'registered':True,'correct':False,'legacy':True,'disabled':True,'path':'fixture.lnk'}

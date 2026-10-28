@@ -115,7 +115,7 @@ class API:
         self.request('PUT', '/providers/proxies/' + quote(provider, safe=''), timeout=8)
 
     def connections(self):
-        return self.request('GET', '/connections', timeout=3).get('connections', [])
+        return self.request('GET', '/connections', timeout=3).get('connections') or []
 
 
 def guard(snapshot, p):

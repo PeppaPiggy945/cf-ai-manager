@@ -53,6 +53,21 @@ class TaskTests(unittest.TestCase):
             self.finish()
         self.assertIn('error', [k for k, _ in self.events])
 
+    def test_completed_scan_reports_publication_failure_without_losing_completion(self):
+        rows = [{'ip': '104.16.1.1', 'accepted': True}]
+        def run(scanner, *args):
+            scanner.event('scan_done', {'rows': rows, 'bytes': 0})
+            return rows, ['fixture']
+        with patch.object(Scanner, 'run', run), \
+             patch('cfai.service.DirectNetwork.discover', return_value=SimpleNamespace(identity=['fixture'])), \
+             patch.object(self.service, 'publish_discovery', side_effect=ControllerError('fixture')):
+            self.service.start_scan(self.p)
+            self.finish()
+        summary = next(value for kind, value in self.events if kind == 'scan_done')
+        self.assertEqual(summary['rows'], rows)
+        self.assertIn('未同步', summary['publication'])
+        self.assertIn('results', [kind for kind, _ in self.events])
+
     def test_cancel_and_scanner_exception_both_release_slot(self):
         for error in [Cancelled(), ValueError('fixture')]:
             with self.subTest(error=type(error).__name__), patch.object(Scanner, 'run', side_effect=error):

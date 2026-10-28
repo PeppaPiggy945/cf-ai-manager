@@ -36,6 +36,11 @@ class FakeAPI:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_no_active_connections_accepts_mihomo_null_response(self):
+        api = API('http://127.0.0.1:9090')
+        with patch.object(api, 'request', return_value={'connections': None}):
+            self.assertEqual(api.connections(), [])
+
     def test_controller_local_only(self):
         for value in ['http://example.com:9090', 'http://127.0.0.1:9090/path', 'http://user:pass@localhost:9090', 'https://localhost:9090']:
             with self.assertRaises(ValueError):

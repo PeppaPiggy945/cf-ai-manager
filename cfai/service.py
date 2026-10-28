@@ -201,6 +201,8 @@ class Service:
                 if len(rows) < 2:
                     raise ValueError('动态配置至少需要两条通过真实验证的节点')
                 nodes = [p.node(r['ip']) for r in rows]
+            refresh_rows = (self.usable_results(p) if reuse and
+                            (self.store.folder(p.id) / 'results.json').exists() else None)
             # Validate with an isolated local provider path first; production provider is never a staging area.
             from tempfile import TemporaryDirectory
             with TemporaryDirectory(prefix='cfai-dynamic-check-') as d:
@@ -214,7 +216,12 @@ class Service:
             write_yaml(destination, config)
             if not reuse:
                 pool.initialize(nodes)
-            self.notify('generated', str(destination))
+            publication = (self.publish_discovery(p, refresh_rows, refresh=True, explicit=True)
+                           if refresh_rows is not None else None)
+            if publication:
+                self.notify('generated', {'path': str(destination), 'publication': publication})
+            else:
+                self.notify('generated', str(destination))
         elif action == 'export':
             instance, destination, provider_only, strategy, selected, count = args
             p = self.profile(instance)
@@ -240,10 +247,15 @@ class Service:
                     bw = row.get('download', {}).get('mbps')
                     if row.get('accepted') and bw is not None:
                         session.history.bandwidth[f"CF-{row['ip']}"] = {'mbps': bw, 'at': row.get('download', {}).get('at', row['validated_at'])}
-            if automatic:
-                self.publish_discovery(p, rows)
+            try:
+                publication = self.publish_discovery(p, rows, refresh=not automatic)
+            except (ControllerError, ValueError, OSError) as exc:
+                # A completed measurement remains useful even if live publication fails.
+                publication = ('动态配置未同步：' + str(exc) if isinstance(exc, (ControllerError, ValueError))
+                               else '动态配置未同步：本机节点池暂不可读写')
+                self.logger.info('pool_publish_failed %s %s', p.id, type(exc).__name__)
             self.notify('results', instance)
-            return True
+            return publication
         elif action == 'stream':
             try:
                 if self.scanning:
@@ -264,12 +276,13 @@ class Service:
             try:
                 if outcome[0] == 'done':
                     _, fingerprint, rows, network, automatic, summary = outcome
-                    if self.command('scan_finished', instance, fingerprint, rows, network, automatic):
+                    publication = self.command('scan_finished', instance, fingerprint, rows, network, automatic)
+                    if publication:
                         coverage = summary.get('coverage', {})
                         self.logger.info('scan_done %s sampled=%s validated=%s accepted=%s', instance,
                                          coverage.get('sampled'), coverage.get('validated'),
                                          sum(bool(r.get('accepted')) for r in rows))
-                        self.notify('scan_done', summary)
+                        self.notify('scan_done', {**summary, 'publication': publication})
                     else:
                         self.notify('scan', '任务已结束，配置或网络已变化；请重新优选')
                 elif outcome[0] == 'cancelled':
@@ -517,20 +530,39 @@ class Service:
             'expected': session.expected, 'hold': session.hold, 'last_switch': session.last_switch,
             'last_optimization': session.policy.last_optimization, 'failed_since': session.failed_since})
 
-    def publish_discovery(self, p, rows):
+    def publish_discovery(self, p, rows, refresh=False, explicit=False):
+        if not p.managed and not explicit:
+            return '动态配置未同步：动态管理未开启'
+        network = DirectNetwork.discover().identity
+        session = self.sessions.get(p.id)
+        if session is None or session.key != context_key(p, network):
+            session = self.sessions[p.id] = Session(p, self.store, network)
+        if session.hold and not explicit:
+            return '动态配置未同步：手动保持中，请在概览点击“恢复自动管理”后重新优选'
         api = API.discover(p)
         state, current = guard(api.snapshot(p), p)
-        session = self.sessions.get(p.id)
-        if state != 'cf' or not p.managed or (session and session.hold):
-            return
+        if state != 'cf':
+            return ('动态配置未同步：Clash 尚未启用本实例的动态配置' if state == 'other_profile'
+                    else '动态配置未同步：Clash 当前策略暂停管理')
+        if session.expected and session.expected != current and not explicit:
+            session.hold = True
+            session.policy.reset()
+            self.persist(p, session)
+            return '动态配置未同步：检测到手动切换，请在概览点击“恢复自动管理”后重新优选'
         pool = NodePool(self.store.folder(p.id), p)
+        if not pool.manifest.exists():
+            return '动态配置未同步：请先生成并启用动态配置'
+        pool.recover(api)
         nodes = pool.nodes()
         protected = {current}
         try:
             for row in api.connections():
                 protected.update(row.get('chains', []))
         except ControllerError:
-            return
+            return '动态配置未同步：无法确认活动连接，请检查 Clash 控制连接'
+        if not any(r.get('accepted') for r in rows):
+            return '动态配置未更新：本轮没有通过验证的节点，保留现用池'
+        candidates = select_results(rows, p.settings.max_pool, ttl=p.settings.export_ttl)
         now = time.time()
         for name, stat in scores(session.history, [n['name'] for n in nodes], p.settings, now).items():
             if stat['failed']:
@@ -538,7 +570,19 @@ class Service:
             else:
                 session.failed_since.pop(name, None)
         original = copy.deepcopy(nodes)
-        for row in rows:
+        if refresh:
+            # A manual scan refreshes available standby slots, while keeping the selected
+            # node and every node used by a live connection. Old standbys fill spare slots.
+            retained = [n for n in nodes if n['name'] in protected]
+            chosen = {n['server'] for n in retained}
+            limit = max(p.settings.target_pool, len(retained))
+            for node in [p.node(r['ip']) for r in candidates] + nodes:
+                if len(chosen) < limit and node['server'] not in chosen:
+                    chosen.add(node['server'])
+            nodes = [n for n in nodes if n['server'] in chosen]
+            nodes.extend(p.node(r['ip']) for r in candidates
+                         if r['ip'] in chosen and r['ip'] not in {n['server'] for n in original})
+        for row in ([] if refresh else candidates):
             if not row['accepted'] or row['ip'] in {n['server'] for n in nodes}:
                 continue
             if len(nodes) >= p.settings.target_pool:
@@ -549,7 +593,13 @@ class Service:
             if len(nodes) < p.settings.max_pool:
                 nodes.append(p.node(row['ip']))
         if nodes != original:
-            pool.publish(api, nodes, lambda: not self.stop_event.is_set() and guard(api.snapshot(p), p) == ('cf', current))
+            pool.publish(api, nodes, lambda: not self.stop_event.is_set() and (explicit or (not session.hold and p.managed))
+                         and tuple(DirectNetwork.discover().identity) == tuple(network)
+                         and guard(api.snapshot(p), p) == ('cf', current))
+            session.last_backup = 0
+            return f'动态配置已同步：{len(nodes)} 条节点，保留当前线路及活动连接'
+        return ('动态节点池未变化：当前线路及活动连接占用保留，或本轮节点已在池中' if refresh
+                else '动态节点池未变化：保留健康节点，仅补充空位或替换长期故障节点')
 
     def start_stream(self, p):
         if not p.settings.stream_url:
